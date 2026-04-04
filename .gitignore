@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# 학습 데이터 (용량 큼 — GitHub 업로드 불가)
+input/
+
+# TensorBoard 로그
+run_kaggle_pt/
+*.tfevents*

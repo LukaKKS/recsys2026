@@ -1,0 +1,169 @@
+"""
+CLS (Complementary Learning Systems) 기반 임베딩 이전 모듈.
+
+LEAF의 Cold Start 문제:
+    롱테일 → 숏헤드 전환 시 기존 임베딩 정보를 버리는 문제를 완화합니다.
+
+CLS 이론 매핑:
+    - 롱테일 테이블 (long_tail_hash) = 해마: 빠른 학습, 개별 패턴 보존
+    - 숏헤드 테이블 (short_head_hash) = 신피질: 느린 학습, 안정적 패턴 유지
+    - 전환 시 해마 → 신피질로 정보 이전 (통합 수면 단계에 해당)
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import numpy as np
+from typing import Set, Optional
+
+
+class TransferModule:
+    """
+    빈도 전환(롱테일 → 숏헤드) 시 임베딩 정보를 보존하는 모듈.
+
+    Parameters
+    ----------
+    long_tail_hash : HashEmbedding
+        롱테일 버킷 인덱스를 생성하는 HashEmbedding 객체.
+    short_head_hash : HashEmbedding or None
+        숏헤드 버킷 인덱스를 생성하는 HashEmbedding 객체.
+        None이면 이전 동작 없이 집합 추적만 수행합니다.
+    emb_l : nn.ModuleList
+        DLRM의 전체 임베딩 테이블 목록 (dlrm.emb_l).
+    compressed_table_mask : np.ndarray
+        각 테이블이 압축 대상인지 나타내는 bool 배열.
+    ln_emb : np.ndarray
+        전체 임베딩 카테고리 수 배열.
+    selected_ln_emb_cum_offsets : torch.Tensor
+        압축 테이블의 글로벌 인덱스 시작 오프셋 (CPU 텐서).
+    alpha : float
+        이전 가중치. alpha * 롱테일 + (1 - alpha) * 기존 숏헤드.
+    """
+
+    def __init__(
+        self,
+        long_tail_hash,
+        short_head_hash,
+        emb_l: nn.ModuleList,
+        compressed_table_mask: np.ndarray,
+        ln_emb: np.ndarray,
+        selected_ln_emb_cum_offsets: torch.Tensor,
+        alpha: float = 0.9,
+    ):
+        self.long_tail_hash = long_tail_hash
+        self.short_head_hash = short_head_hash
+        self.emb_l = emb_l
+        self.alpha = alpha
+
+        # 압축 테이블의 emb_l 내 실제 인덱스 목록
+        self.compressed_table_indices: list[int] = [
+            k for k, is_comp in enumerate(compressed_table_mask) if is_comp
+        ]
+        self.num_compressed = len(self.compressed_table_indices)
+
+        # 글로벌 인덱스 → 테이블 매핑에 필요한 오프셋/크기
+        self._cum_offsets = selected_ln_emb_cum_offsets.cpu().tolist()
+        self._table_sizes = ln_emb[compressed_table_mask].tolist()
+
+        # 이전 배치의 숏헤드 집합 (초기값: 빈 집합)
+        self._prev_short_head_set: Set[int] = set()
+
+    # ------------------------------------------------------------------
+    # 공개 메서드
+    # ------------------------------------------------------------------
+
+    def detect_transitions(self, current_short_head_set: Set[int]) -> Set[int]:
+        """이번 배치에서 새롭게 숏헤드가 된 인덱스 집합 반환."""
+        return current_short_head_set - self._prev_short_head_set
+
+    def transfer_embeddings(
+        self,
+        newly_frequent: Set[int],
+        device: torch.device,
+    ) -> int:
+        """
+        롱테일 버킷 임베딩 → 숏헤드 버킷으로 가중 복사.
+
+        이전 공식:
+            new_sh = alpha * lt_vec + (1 - alpha) * old_sh_vec
+
+        Returns
+        -------
+        int
+            실제로 이전된 특성(글로벌 인덱스) 수.
+        """
+        if not newly_frequent or self.short_head_hash is None:
+            return 0
+
+        transferred = 0
+        with torch.no_grad():
+            for g_idx in newly_frequent:
+                table_pos, local_idx = self._global_to_table(g_idx)
+                if table_pos is None:
+                    continue
+
+                k = self.compressed_table_indices[table_pos]
+                emb_bag = self.emb_l[k]  # nn.EmbeddingBag
+                n_rows = emb_bag.weight.shape[0]
+
+                g_tensor = torch.tensor([g_idx], dtype=torch.long)
+
+                # 각 HashEmbedding에서 버킷 인덱스 추출
+                # shape: [num_hashes, 1]
+                lt_buckets = self.long_tail_hash.get_hash_embedding_tensors(g_tensor)
+                sh_buckets = self.short_head_hash.get_hash_embedding_tensors(g_tensor)
+
+                # num_hashes 차원을 순회하며 이전
+                n_hashes = lt_buckets.shape[0]
+                for h in range(n_hashes):
+                    lt_b = int(lt_buckets[h, 0].item())
+                    sh_b = int(sh_buckets[h, 0].item())
+
+                    if 0 <= lt_b < n_rows and 0 <= sh_b < n_rows:
+                        lt_vec = emb_bag.weight.data[lt_b].clone()
+                        sh_vec = emb_bag.weight.data[sh_b]
+                        emb_bag.weight.data[sh_b] = (
+                            self.alpha * lt_vec + (1.0 - self.alpha) * sh_vec
+                        )
+
+                transferred += 1
+
+        return transferred
+
+    def update(self, current_short_head_set: Set[int], device: torch.device) -> int:
+        """
+        매 배치마다 호출.
+
+        1. 전환 감지 (detect_transitions)
+        2. 임베딩 이전 (transfer_embeddings)
+        3. 이전 집합 갱신
+
+        Returns
+        -------
+        int
+            이번 배치에서 이전된 특성 수.
+        """
+        newly_frequent = self.detect_transitions(current_short_head_set)
+        n_transferred = self.transfer_embeddings(newly_frequent, device)
+        # 다음 배치 비교를 위해 현재 집합 저장
+        self._prev_short_head_set = set(current_short_head_set)
+        return n_transferred
+
+    # ------------------------------------------------------------------
+    # 내부 헬퍼
+    # ------------------------------------------------------------------
+
+    def _global_to_table(self, global_idx: int):
+        """
+        글로벌 인덱스 → (압축 테이블 위치, 로컬 인덱스) 변환.
+
+        압축 테이블은 `selected_ln_emb_cum_offsets`로 순서가 매겨져 있고,
+        각 테이블의 인덱스 범위는 [cum_offset[i], cum_offset[i] + size[i]) 입니다.
+        """
+        for pos in range(self.num_compressed):
+            start = int(self._cum_offsets[pos])
+            end = start + int(self._table_sizes[pos])
+            if start <= global_idx < end:
+                return pos, global_idx - start
+        return None, None
