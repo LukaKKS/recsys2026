@@ -1336,8 +1336,12 @@ def run():
     # CLS Cold Start 모듈
     parser.add_argument("--use-cls", action="store_true", default=False,
                         help="CLS 기반 Cold Start 완화 모듈 활성화")
-    parser.add_argument("--cls-alpha", type=float, default=0.9,
-                        help="임베딩 이전 가중치 α (alpha*롱테일 + (1-α)*숏헤드)")
+    parser.add_argument("--cls-alpha", type=float, default=None,
+                        help="임베딩 이전 가중치 α 고정값 (지정 시 alpha_min=alpha_max=해당값)")
+    parser.add_argument("--cls-alpha-min", type=float, default=0.1,
+                        help="동적 alpha 최솟값 (학습 초반, 배치 0)")
+    parser.add_argument("--cls-alpha-max", type=float, default=0.9,
+                        help="동적 alpha 최댓값 (학습 후반, 배치 total_batches)")
 
 
     global args
@@ -1722,6 +1726,13 @@ def run():
     dynamic_lr = None
     if args.use_adaptive_encoding and args.use_cls:
         if long_tail_hash is not None and selected_ln_emb_cum_offsets is not None:
+            # --cls-alpha 고정값이 지정된 경우 alpha_min=alpha_max로 동작
+            if args.cls_alpha is not None:
+                cls_alpha_min = args.cls_alpha
+                cls_alpha_max = args.cls_alpha
+            else:
+                cls_alpha_min = args.cls_alpha_min
+                cls_alpha_max = args.cls_alpha_max
             transfer_module = TransferModule(
                 long_tail_hash=long_tail_hash,
                 short_head_hash=short_head_hash,
@@ -1729,12 +1740,15 @@ def run():
                 compressed_table_mask=compressed_table_mask,
                 ln_emb=ln_emb,
                 selected_ln_emb_cum_offsets=selected_ln_emb_cum_offsets,
-                alpha=args.cls_alpha,
+                alpha_min=cls_alpha_min,
+                alpha_max=cls_alpha_max,
+                total_batches=nbatches,
             )
             dynamic_lr = DynamicLR(base_lr=args.learning_rate)
             print(
                 f"[CLS] TransferModule 초기화 완료 "
-                f"(alpha={args.cls_alpha}, "
+                f"(alpha_min={cls_alpha_min}, alpha_max={cls_alpha_max}, "
+                f"total_batches={nbatches}, "
                 f"압축 테이블 수={len(transfer_module.compressed_table_indices)})"
             )
             print(f"[CLS] {dynamic_lr}")

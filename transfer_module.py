@@ -37,8 +37,12 @@ class TransferModule:
         전체 임베딩 카테고리 수 배열.
     selected_ln_emb_cum_offsets : torch.Tensor
         압축 테이블의 글로벌 인덱스 시작 오프셋 (CPU 텐서).
-    alpha : float
-        이전 가중치. alpha * 롱테일 + (1 - alpha) * 기존 숏헤드.
+    alpha_min : float
+        학습 초반(배치 0)에 사용할 최소 alpha.
+    alpha_max : float
+        학습 후반(배치 total_batches)에 사용할 최대 alpha.
+    total_batches : int
+        전체 학습 배치 수. progress 계산 기준.
     """
 
     def __init__(
@@ -49,12 +53,17 @@ class TransferModule:
         compressed_table_mask: np.ndarray,
         ln_emb: np.ndarray,
         selected_ln_emb_cum_offsets: torch.Tensor,
-        alpha: float = 0.9,
+        alpha_min: float = 0.1,
+        alpha_max: float = 0.9,
+        total_batches: int = 282891,
     ):
         self.long_tail_hash = long_tail_hash
         self.short_head_hash = short_head_hash
         self.emb_l = emb_l
-        self.alpha = alpha
+        self.alpha_min = alpha_min
+        self.alpha_max = alpha_max
+        self.total_batches = total_batches
+        self.alpha = alpha_min  # 현재 배치에서 사용할 alpha (update()에서 갱신)
 
         # 압축 테이블의 emb_l 내 실제 인덱스 목록
         self.compressed_table_indices: list[int] = [
@@ -131,19 +140,30 @@ class TransferModule:
 
         return transferred
 
-    def update(self, current_short_head_set: Set[int], device: torch.device) -> int:
+    def update(
+        self,
+        current_short_head_set: Set[int],
+        device: torch.device,
+        current_batch: int = 0,
+    ) -> int:
         """
         매 배치마다 호출.
 
-        1. 전환 감지 (detect_transitions)
-        2. 임베딩 이전 (transfer_embeddings)
-        3. 이전 집합 갱신
+        1. 학습 진행도에 따라 alpha 동적 갱신
+           progress = current_batch / total_batches
+           alpha = alpha_min + (alpha_max - alpha_min) * progress
+        2. 전환 감지 (detect_transitions)
+        3. 임베딩 이전 (transfer_embeddings)
+        4. 이전 집합 갱신
 
         Returns
         -------
         int
             이번 배치에서 이전된 특성 수.
         """
+        progress = current_batch / max(self.total_batches, 1)
+        self.alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * progress
+
         newly_frequent = self.detect_transitions(current_short_head_set)
         n_transferred = self.transfer_embeddings(newly_frequent, device)
         # 다음 배치 비교를 위해 현재 집합 저장

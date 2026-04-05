@@ -242,9 +242,9 @@ def batch_adaptive_encoding_with_hashing(
 
         # CLS: 전환 감지 및 임베딩 이전 (short_head_indices_set은 get_frequency_percentile에서 갱신됨)
         if transfer_module is not None:
-            n_transferred = transfer_module.update(short_head_indices_set, device)
+            n_transferred = transfer_module.update(short_head_indices_set, device, iteration_index)
             if n_transferred > 0:
-                print(f"[CLS] 전환된 특성 수: {n_transferred}개 → 정보 이전 완료")
+                print(f"[CLS] 전환된 특성 수: {n_transferred}개 → 정보 이전 완료 (alpha={transfer_module.alpha:.2f})")
     else:
         result = long_tail_operation(emb_indices, long_tail_hashing)
 
