@@ -25,18 +25,37 @@ class OnlineFrequencyChecker:
     def __init__(self, lg_max_k=10):
         self.sketch = frequent_items_sketch(lg_max_k)
         self.lg_max_k = lg_max_k
+        # {idx: remaining_batches_on_blacklist}
+        # datasketches는 카운터 직접 수정 불가 → 블랙리스트로 재진입을 제어
+        self._decay_blacklist: Dict[int, int] = {}
 
     def add_elements(self, elements):
         for item in elements:
             self.sketch.update(item.item())
 
     def get_frequency_percentile(self, percentile: float, short_head_indices_set=set()) -> int:
+        # 블랙리스트 카운터 감소 및 만료 항목 제거
+        if self._decay_blacklist:
+            expired = [idx for idx, cnt in self._decay_blacklist.items() if cnt <= 0]
+            for idx in expired:
+                del self._decay_blacklist[idx]
+            for idx in list(self._decay_blacklist.keys()):
+                self._decay_blacklist[idx] -= 1
+
         frequent_items = self.sketch.get_frequent_items(
             err_type=frequent_items_error_type.NO_FALSE_POSITIVES,
             threshold=0
         )
+
+        # 블랙리스트 항목 제외 (스케치 카운터가 높아도 일정 기간 재진입 차단)
+        if self._decay_blacklist:
+            frequent_items = [item for item in frequent_items
+                              if item[0] not in self._decay_blacklist]
+
+        if not frequent_items:
+            return 0, []
+
         top_index = max(0, int(len(frequent_items) * percentile) - 1)
-        index_frequency_list = [e[:2] for e in frequent_items]
         indices = [e[0] for e in frequent_items]
         short_head_indices_set.update(indices)
         top_percentile_frequency = frequent_items[top_index][1]
@@ -50,6 +69,7 @@ class OnlineFrequencyChecker:
         current_batch: int,
         decay_freq: int,
         min_size: int = 100,
+        grace_period: int = 100,
     ) -> set:
         """
         Dynamic SMED: 주기적으로 short_head_indices_set에서
@@ -61,21 +81,25 @@ class OnlineFrequencyChecker:
         2. short_head_indices_set을 빈도 오름차순으로 정렬한다.
         3. 하위 (1 - decay_rate) 비율 항목을 집합에서 제거한다.
            (min_size 이하로는 제거하지 않는다.)
-        4. 제거된 항목은 다음 배치에서 get_frequency_percentile이
-           다시 추가하므로 detect_transitions가 재전환을 감지한다.
+        4. 제거된 항목을 블랙리스트에 등록 (grace_period 배치 동안).
+           → get_frequency_percentile에서 스케치 카운터가 높아도 재진입 차단
+           → grace_period 경과 후 자연스럽게 재진입 → 재전환 감지!
 
         Parameters
         ----------
         short_head_indices_set : set
             현재 고빈도 집합 (in-place 수정).
         decay_rate : float
-            0~1. 상위 decay_rate 비율만 유지. (0.5 → 하위 50% 제거)
+            0~1. 상위 decay_rate 비율만 유지. (0.8 → 하위 20% 제거)
         current_batch : int
             현재 배치 번호.
         decay_freq : int
             decay 적용 주기 (배치 단위).
         min_size : int
             short_head_indices_set 최소 유지 크기.
+        grace_period : int
+            decay 후 재진입 금지 배치 수. 이 기간 동안 스케치 카운터가
+            높아도 get_frequency_percentile에서 제외된다.
 
         Returns
         -------
@@ -107,6 +131,13 @@ class OnlineFrequencyChecker:
 
         decayed = set(sh_sorted[:n_to_remove])
         short_head_indices_set -= decayed
+
+        # 블랙리스트 등록: grace_period 배치 동안 스케치 재진입 차단
+        # → 스케치 카운터가 높아도 즉시 재추가되지 않음
+        # → 실질적인 "저빈도로 내려간 것처럼" 동작 → 재전환 유도
+        for idx in decayed:
+            self._decay_blacklist[idx] = grace_period
+
         return decayed
 
 

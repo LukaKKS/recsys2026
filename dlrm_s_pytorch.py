@@ -1352,6 +1352,10 @@ def run():
     parser.add_argument("--cls-decay-rate", type=float, default=0.8,
                         help="Dynamic SMED: 상위 몇 %%를 유지할지 (0.8=상위 80%% 유지, 하위 20%% 제거). "
                              "Ablation: 0.5/0.7/0.8/0.9 권장")
+    parser.add_argument("--cls-decay-grace", type=int, default=100,
+                        help="Dynamic SMED: decay 후 재진입 금지 배치 수 (기본값 100). "
+                             "이 기간 동안 스케치 카운터가 높아도 short_head_indices_set 재진입 차단. "
+                             "grace 경과 후 재등장하면 재전환으로 감지.")
 
 
     global args
@@ -1999,6 +2003,7 @@ def run():
                             decay_rate=args.cls_decay_rate,
                             current_batch=j,
                             decay_freq=args.cls_decay_freq,
+                            grace_period=args.cls_decay_grace,
                         )
                         if decayed:
                             # decay된 항목만 _prev_short_head_set에서 제거
