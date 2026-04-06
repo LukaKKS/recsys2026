@@ -87,8 +87,23 @@ class TransferModule:
     # ------------------------------------------------------------------
 
     def detect_transitions(self, current_short_head_set: Set[int]) -> Set[int]:
-        """이번 배치에서 새롭게 숏헤드가 된 인덱스 집합 반환."""
+        """이번 배치에서 새롭게 숏헤드가 된 인덱스 집합 반환.
+
+        Dynamic SMED decay 이후 apply_decay()가 short_head_indices_set에서
+        항목을 제거하고 sync_prev_set()으로 _prev_short_head_set을 갱신하면,
+        다음 배치에서 제거된 항목이 재진입할 때 여기서 재전환으로 감지된다.
+        """
         return current_short_head_set - self._prev_short_head_set
+
+    def sync_prev_set(self, short_head_set: Set[int]) -> None:
+        """_prev_short_head_set을 현재 short_head_set에 동기화.
+
+        apply_decay() 호출 직후 사용:
+          short_head_indices_set에서 항목이 제거된 뒤 이 메서드를 호출하면
+          다음 배치의 detect_transitions가 제거된 항목의 재진입을
+          '새로운 전환'으로 올바르게 감지한다.
+        """
+        self._prev_short_head_set = set(short_head_set)
 
     def transfer_embeddings(
         self,

@@ -24,7 +24,8 @@ from datasketches import frequent_items_error_type
 class OnlineFrequencyChecker:
     def __init__(self, lg_max_k=10):
         self.sketch = frequent_items_sketch(lg_max_k)
-    
+        self.lg_max_k = lg_max_k
+
     def add_elements(self, elements):
         for item in elements:
             self.sketch.update(item.item())
@@ -41,6 +42,72 @@ class OnlineFrequencyChecker:
         top_percentile_frequency = frequent_items[top_index][1]
         short_head_indices = [e[0] for e in frequent_items[:top_index + 1]]
         return top_percentile_frequency, short_head_indices
+
+    def apply_decay(
+        self,
+        short_head_indices_set: set,
+        decay_rate: float,
+        current_batch: int,
+        decay_freq: int,
+        min_size: int = 100,
+    ) -> set:
+        """
+        Dynamic SMED: 주기적으로 short_head_indices_set에서
+        저빈도 항목을 제거하여 재전환(re-transition)을 유도한다.
+
+        동작 원리
+        ---------
+        1. 스케치에서 현재 빈도 정보를 읽는다.
+        2. short_head_indices_set을 빈도 오름차순으로 정렬한다.
+        3. 하위 (1 - decay_rate) 비율 항목을 집합에서 제거한다.
+           (min_size 이하로는 제거하지 않는다.)
+        4. 제거된 항목은 다음 배치에서 get_frequency_percentile이
+           다시 추가하므로 detect_transitions가 재전환을 감지한다.
+
+        Parameters
+        ----------
+        short_head_indices_set : set
+            현재 고빈도 집합 (in-place 수정).
+        decay_rate : float
+            0~1. 상위 decay_rate 비율만 유지. (0.5 → 하위 50% 제거)
+        current_batch : int
+            현재 배치 번호.
+        decay_freq : int
+            decay 적용 주기 (배치 단위).
+        min_size : int
+            short_head_indices_set 최소 유지 크기.
+
+        Returns
+        -------
+        set
+            이번 decay에서 저빈도로 내려간 인덱스 집합.
+        """
+        if current_batch % decay_freq != 0 or current_batch == 0:
+            return set()
+        if not short_head_indices_set:
+            return set()
+
+        # 스케치에서 현재 빈도 맵 구성
+        frequent_items = self.sketch.get_frequent_items(
+            err_type=frequent_items_error_type.NO_FALSE_POSITIVES,
+            threshold=0,
+        )
+        item_counts = {item[0]: item[1] for item in frequent_items}
+
+        # short_head_indices_set을 빈도 오름차순으로 정렬 (빈도 0 = 최우선 제거)
+        sh_sorted = sorted(short_head_indices_set, key=lambda x: item_counts.get(x, 0))
+
+        n_total = len(sh_sorted)
+        n_to_remove = int(n_total * (1.0 - decay_rate))
+        # min_size 보호: 제거 후 집합 크기가 min_size 이하가 되지 않도록
+        n_to_remove = min(n_to_remove, max(0, n_total - min_size))
+
+        if n_to_remove <= 0:
+            return set()
+
+        decayed = set(sh_sorted[:n_to_remove])
+        short_head_indices_set -= decayed
+        return decayed
 
 
 def get_indices_and_offsets(selected_rows):

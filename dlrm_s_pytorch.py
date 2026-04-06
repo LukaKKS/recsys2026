@@ -1347,6 +1347,10 @@ def run():
                         help="동적 alpha 최댓값 (학습 후반, 배치 total_batches)")
     parser.add_argument("--cls-surge-k", type=int, default=24,
                         help="전환 특성에 일시적으로 부여할 해시 함수 수 (기본 k보다 커야 효과적)")
+    parser.add_argument("--cls-decay-freq", type=int, default=10000,
+                        help="Dynamic SMED: 몇 배치마다 short_head_indices_set decay를 적용할지")
+    parser.add_argument("--cls-decay-rate", type=float, default=0.5,
+                        help="Dynamic SMED: 상위 몇 %를 유지할지 (0.5=상위 50% 유지, 하위 50% 제거)")
 
 
     global args
@@ -1981,6 +1985,30 @@ def run():
                         transfer_module=transfer_module,
                         surge_long_tail_hash=surge_long_tail_hash,
                     )
+
+                    # Dynamic SMED decay: short_head_indices_set에서
+                    # 저빈도 항목을 주기적으로 제거 → 재전환 유도
+                    if (
+                        args.use_cls
+                        and online_frequency_checker is not None
+                        and transfer_module is not None
+                    ):
+                        decayed = online_frequency_checker.apply_decay(
+                            short_head_indices_set=short_head_indices_set,
+                            decay_rate=args.cls_decay_rate,
+                            current_batch=j,
+                            decay_freq=args.cls_decay_freq,
+                        )
+                        if decayed:
+                            # _prev_short_head_set을 post-decay 상태로 갱신
+                            # → 다음 배치에서 제거된 항목이 재진입하면 새 전환으로 감지
+                            transfer_module.sync_prev_set(short_head_indices_set)
+                            print(
+                                f"[CLS] Dynamic SMED decay 적용 "
+                                f"(저빈도로 내려간 특성: {len(decayed)}개, "
+                                f"decay_rate={args.cls_decay_rate}, "
+                                f"batch={j})"
+                            )
 
                     if (j + 1) % 10000 == 0:
                         train_end_time = time.time()
