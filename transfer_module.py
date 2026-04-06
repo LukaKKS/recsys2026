@@ -78,6 +78,10 @@ class TransferModule:
         # 이전 배치의 숏헤드 집합 (초기값: 빈 집합)
         self._prev_short_head_set: Set[int] = set()
 
+        # 직전 배치에서 새롭게 숏헤드가 된 인덱스 집합
+        # adaptive_encoding에서 surge-k 해싱에 사용
+        self.newly_frequent: Set[int] = set()
+
     # ------------------------------------------------------------------
     # 공개 메서드
     # ------------------------------------------------------------------
@@ -146,7 +150,7 @@ class TransferModule:
         current_short_head_set: Set[int],
         device: torch.device,
         current_batch: int = 0,
-    ) -> int:
+    ) -> Set[int]:
         """
         매 배치마다 호출.
 
@@ -154,22 +158,27 @@ class TransferModule:
            alpha = alpha_min + (alpha_max - alpha_min) * progress
         2. 전환 감지 (detect_transitions)
         3. 임베딩 이전 (transfer_embeddings)
-        4. 이전 집합 갱신
+        4. 다음 배치를 위해 전환 집합 저장 (self.newly_frequent)
+        5. 이전 집합 갱신
 
         Returns
         -------
-        int
-            이번 배치에서 이전된 특성 수.
+        Set[int]
+            이번 배치에서 새롭게 숏헤드가 된 글로벌 인덱스 집합.
+            다음 배치의 surge-k 해싱에 활용하기 위해 self.newly_frequent에도 저장.
         """
         progress = current_batch / max(self.total_batches, 1)
         self.alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * progress
 
         newly_frequent = self.detect_transitions(current_short_head_set)
-        n_transferred = self.transfer_embeddings(newly_frequent, device)
+        self.transfer_embeddings(newly_frequent, device)
+
+        # 다음 배치의 surge-k 해싱을 위해 전환 집합 보존
+        self.newly_frequent = newly_frequent
 
         # 다음 배치 비교를 위해 현재 집합 저장
         self._prev_short_head_set = set(current_short_head_set)
-        return n_transferred
+        return newly_frequent
 
     # ------------------------------------------------------------------
     # 내부 헬퍼

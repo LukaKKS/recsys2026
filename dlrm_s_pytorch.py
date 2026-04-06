@@ -170,6 +170,7 @@ def dlrm_wrap(
     short_head_indices_set=set(),
     train_time=None,
     transfer_module=None,
+    surge_long_tail_hash=None,
 ):
     with record_function("DLRM forward"):
         # --- CPU-mode adaptive encoding (runs when use_gpu=False, e.g. Apple Silicon) ---
@@ -191,6 +192,7 @@ def dlrm_wrap(
                 frequency_percentile,
                 short_head_indices_set,
                 transfer_module=transfer_module,
+                surge_long_tail_hash=surge_long_tail_hash,
             )
             lS_i_tmp = []
             j = 0
@@ -231,6 +233,7 @@ def dlrm_wrap(
                             frequency_percentile,
                             short_head_indices_set,
                             transfer_module=transfer_module,
+                            surge_long_tail_hash=surge_long_tail_hash,
                         )
 
                         lS_i_tmp = []
@@ -1342,6 +1345,8 @@ def run():
                         help="동적 alpha 최솟값 (학습 초반, 배치 0)")
     parser.add_argument("--cls-alpha-max", type=float, default=0.9,
                         help="동적 alpha 최댓값 (학습 후반, 배치 total_batches)")
+    parser.add_argument("--cls-surge-k", type=int, default=24,
+                        help="전환 특성에 일시적으로 부여할 해시 함수 수 (기본 k보다 커야 효과적)")
 
 
     global args
@@ -1436,6 +1441,7 @@ def run():
         compressed_table_mask = ln_emb > capacity
         long_tail_hash = None
         short_head_hash = None
+        surge_long_tail_hash = None
         short_head_indices_set = set()
 
         if args.use_adaptive_encoding:
@@ -1451,6 +1457,9 @@ def run():
             num_buckets_short_head = capacity - num_buckets_long_tail
             long_tail_hash = HashEmbedding(total_unique_indices, args.arch_sparse_feature_size, num_buckets=num_buckets_long_tail, num_hashes=args.num_long_tail_hashes, append_weight=False, device=device)
             short_head_hash = None if num_buckets_short_head <= 0 else HashEmbedding(total_unique_indices, args.arch_sparse_feature_size, num_buckets=num_buckets_short_head, num_hashes=args.num_short_head_hashes, append_weight=False, offsets=num_buckets_long_tail, device=device)
+            # surge-k: 전환 특성에 더 많은 해시 함수 적용 (같은 lt 버킷 범위, 다른 hash 함수)
+            surge_k = args.cls_surge_k if args.use_cls else args.num_long_tail_hashes
+            surge_long_tail_hash = HashEmbedding(total_unique_indices, args.arch_sparse_feature_size, num_buckets=num_buckets_long_tail, num_hashes=surge_k, append_weight=False, device=device) if (args.use_cls and surge_k > args.num_long_tail_hashes) else None
 
         print(f"ln_emb: {ln_emb}")
         hash_rate = 0
@@ -1970,6 +1979,7 @@ def run():
                         short_head_indices_set=short_head_indices_set,
                         train_time=internal_train_timer,
                         transfer_module=transfer_module,
+                        surge_long_tail_hash=surge_long_tail_hash,
                     )
 
                     if (j + 1) % 10000 == 0:
@@ -2158,6 +2168,7 @@ def run():
                 frequency_percentile=args.frequency_percentile,
                 short_head_indices_set=short_head_indices_set,
                 transfer_module=None,
+                surge_long_tail_hash=None,
             )
 
     # profiling

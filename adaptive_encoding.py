@@ -225,26 +225,71 @@ def batch_adaptive_encoding_with_hashing(
     frequency_percentile,
     short_head_indices_set=set(),
     transfer_module=None,
+    surge_long_tail_hash=None,
 ):
     if emb_indices_tensor.dim() == 1:
         emb_indices_tensor = emb_indices_tensor.unsqueeze(1)
     emb_indices = (emb_indices_tensor + selected_ln_emb_offsets.unsqueeze(1)).view(-1)
     online_frequency_checker.add_elements(emb_indices.cpu())
 
+    # 직전 배치에서 전환된 특성 집합 (surge-k 해싱 대상)
+    # update()가 호출되기 전에 읽어야 이전 배치의 값을 사용할 수 있음
+    prev_newly_frequent = (
+        transfer_module.newly_frequent
+        if transfer_module is not None
+        else set()
+    )
+
     # Here we assume num_hashes in short_head_hashing and long_tail_hashing are the same. So the output dimensions are also the same. No need for zero paddings.
     if short_head_hashing != None:
         short_head_long_tail_threshold, short_head_indices = online_frequency_checker.get_frequency_percentile(frequency_percentile, short_head_indices_set)
         short_head_tensor = torch.tensor(short_head_indices, device=device)
         short_head_mask = torch.any(emb_indices.unsqueeze(1) == short_head_tensor.unsqueeze(0), dim=1)
-        result = torch.where(short_head_mask,
-            short_head_operation(emb_indices, short_head_hashing),
-            long_tail_operation(emb_indices, long_tail_hashing))
+
+        # 기본 lt/sh 라우팅 (num_hashes, n)
+        num_hashes = long_tail_hashing.num_hashes
+        n = emb_indices.shape[0]
+        base_lt = long_tail_operation(emb_indices, long_tail_hashing)   # [num_hashes, n]
+        base_sh = short_head_operation(emb_indices, short_head_hashing) # [num_hashes, n]
+        result = torch.where(short_head_mask, base_sh, base_lt)         # [num_hashes, n]
+
+        # surge-k: 직전 배치에서 전환된 특성을 더 많은 해시 함수로 재해싱
+        if surge_long_tail_hash is not None and len(prev_newly_frequent) > 0:
+            surge_k = surge_long_tail_hash.num_hashes
+            surging_tensor = torch.tensor(
+                list(prev_newly_frequent), dtype=torch.long, device=device
+            )
+            surging_mask = torch.isin(emb_indices, surging_tensor)  # [n]
+
+            if surging_mask.any():
+                # 전환 특성 → surge_lt_hash (k=surge_k) 로 해싱, 나머지는 0
+                surge_result = surge_long_tail_hash.get_hash_embedding_tensors(
+                    emb_indices
+                )  # [surge_k, n]
+                surge_result = surge_result * surging_mask.long()  # 비전환 위치 → 0
+
+                # 기본 result에서 전환 특성 위치를 0으로 비우고 패딩
+                normal_result = result * (~surging_mask).long()  # [num_hashes, n]
+                if surge_k > num_hashes:
+                    pad = torch.zeros(
+                        surge_k - num_hashes, n,
+                        dtype=normal_result.dtype, device=device,
+                    )
+                    normal_result = torch.cat([normal_result, pad], dim=0)  # [surge_k, n]
+
+                # 합산: 전환 특성=surge_result, 나머지=normal_result (0 필터링은 get_indices_and_offsets에서 처리)
+                result = normal_result + surge_result  # [surge_k, n]
+
+                n_surging = surging_mask.sum().item()
+                print(
+                    f"[CLS] 전환 특성 {n_surging}개 → k={surge_k}로 해싱 (충돌 감소)"
+                )
 
         # CLS: 전환 감지 및 임베딩 이전 (short_head_indices_set은 get_frequency_percentile에서 갱신됨)
         if transfer_module is not None:
-            n_transferred = transfer_module.update(short_head_indices_set, device, iteration_index)
-            if n_transferred > 0:
-                print(f"[CLS] 전환된 특성 수: {n_transferred}개 → 정보 이전 완료 (alpha={transfer_module.alpha:.2f})")
+            newly_frequent = transfer_module.update(short_head_indices_set, device, iteration_index)
+            if len(newly_frequent) > 0:
+                print(f"[CLS] 전환된 특성 수: {len(newly_frequent)}개 → 정보 이전 완료 (alpha={transfer_module.alpha:.2f})")
     else:
         result = long_tail_operation(emb_indices, long_tail_hashing)
 
