@@ -1342,12 +1342,6 @@ def run():
                         help="동적 alpha 최솟값 (학습 초반, 배치 0)")
     parser.add_argument("--cls-alpha-max", type=float, default=0.9,
                         help="동적 alpha 최댓값 (학습 후반, 배치 total_batches)")
-    parser.add_argument("--cls-beta-max", type=float, default=0.2,
-                        help="backward 이전 최대 beta (학습 초반, cold 행에 적용)")
-    parser.add_argument("--cls-beta-min", type=float, default=0.05,
-                        help="backward 이전 최소 beta (학습 후반)")
-    parser.add_argument("--cls-reverse-freq", type=int, default=1000,
-                        help="backward 이전(고→저) 실행 주기 (배치 단위)")
 
 
     global args
@@ -1746,20 +1740,14 @@ def run():
                 compressed_table_mask=compressed_table_mask,
                 ln_emb=ln_emb,
                 selected_ln_emb_cum_offsets=selected_ln_emb_cum_offsets,
-                online_frequency_checker=online_frequency_checker,
                 alpha_min=cls_alpha_min,
                 alpha_max=cls_alpha_max,
                 total_batches=nbatches,
-                beta_max=args.cls_beta_max,
-                beta_min=args.cls_beta_min,
-                reverse_freq=args.cls_reverse_freq,
             )
             dynamic_lr = DynamicLR(base_lr=args.learning_rate)
             print(
                 f"[CLS] TransferModule 초기화 완료 "
                 f"(alpha_min={cls_alpha_min}, alpha_max={cls_alpha_max}, "
-                f"beta_max={args.cls_beta_max}, beta_min={args.cls_beta_min}, "
-                f"reverse_freq={args.cls_reverse_freq}, "
                 f"total_batches={nbatches}, "
                 f"압축 테이블 수={len(transfer_module.compressed_table_indices)})"
             )
