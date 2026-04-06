@@ -52,8 +52,13 @@ class OnlineFrequencyChecker:
 
         # 블랙리스트 항목 제외 (스케치 카운터가 높아도 일정 기간 재진입 차단)
         if self._decay_blacklist:
+            before_count = len(frequent_items)
             frequent_items = [item for item in frequent_items
                               if item[0] not in self._decay_blacklist]
+            after_count = len(frequent_items)
+            print(f"[CLS-DEBUG] 필터링 전: {before_count}개 / "
+                  f"블랙리스트 필터링 후: {after_count}개 "
+                  f"(차단 중: {len(self._decay_blacklist)}개)")
 
         if not frequent_items:
             return 0, []
