@@ -2001,9 +2001,10 @@ def run():
                             decay_freq=args.cls_decay_freq,
                         )
                         if decayed:
-                            # _prev_short_head_set을 post-decay 상태로 갱신
-                            # → 다음 배치에서 제거된 항목이 재진입하면 새 전환으로 감지
-                            transfer_module.sync_prev_set(short_head_indices_set)
+                            # decay된 항목만 _prev_short_head_set에서 제거
+                            # → prev_set은 decay 이전 상태를 유지하되
+                            #   decay된 항목만 빠짐 → 재진입 시 재전환 감지
+                            transfer_module.remove_from_prev_set(decayed)
                             print(
                                 f"[CLS] Dynamic SMED decay 적용 "
                                 f"(저빈도로 내려간 특성: {len(decayed)}개, "
