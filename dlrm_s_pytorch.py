@@ -1349,8 +1349,9 @@ def run():
                         help="전환 특성에 일시적으로 부여할 해시 함수 수 (기본 k보다 커야 효과적)")
     parser.add_argument("--cls-decay-freq", type=int, default=10000,
                         help="Dynamic SMED: 몇 배치마다 short_head_indices_set decay를 적용할지")
-    parser.add_argument("--cls-decay-rate", type=float, default=0.5,
-                        help="Dynamic SMED: 상위 몇 %를 유지할지 (0.5=상위 50% 유지, 하위 50% 제거)")
+    parser.add_argument("--cls-decay-rate", type=float, default=0.8,
+                        help="Dynamic SMED: 상위 몇 %%를 유지할지 (0.8=상위 80%% 유지, 하위 20%% 제거). "
+                             "Ablation: 0.5/0.7/0.8/0.9 권장")
 
 
     global args
