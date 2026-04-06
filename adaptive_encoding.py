@@ -34,13 +34,15 @@ class OnlineFrequencyChecker:
             self.sketch.update(item.item())
 
     def get_frequency_percentile(self, percentile: float, short_head_indices_set=set()) -> int:
-        # 블랙리스트 카운터 감소 및 만료 항목 제거
+        # 블랙리스트 카운터 감소, 만료 항목은 short_head_indices_set에 직접 재추가
+        # (스케치가 저빈도 항목을 evict하더라도 재전환이 보장됨)
         if self._decay_blacklist:
             expired = [idx for idx, cnt in self._decay_blacklist.items() if cnt <= 0]
-            for idx in expired:
-                del self._decay_blacklist[idx]
             if expired:
-                print(f"[CLS-DEBUG] 블랙리스트 만료: {len(expired)}개 → short_head 재진입 허용 "
+                for idx in expired:
+                    del self._decay_blacklist[idx]
+                    short_head_indices_set.add(idx)  # 스케치 의존 없이 직접 재추가
+                print(f"[CLS] 블랙리스트 만료: {len(expired)}개 → short_head_indices_set 직접 재추가 "
                       f"(잔여 블랙리스트: {len(self._decay_blacklist)}개)")
             for idx in list(self._decay_blacklist.keys()):
                 self._decay_blacklist[idx] -= 1
@@ -52,13 +54,8 @@ class OnlineFrequencyChecker:
 
         # 블랙리스트 항목 제외 (스케치 카운터가 높아도 일정 기간 재진입 차단)
         if self._decay_blacklist:
-            before_count = len(frequent_items)
             frequent_items = [item for item in frequent_items
                               if item[0] not in self._decay_blacklist]
-            after_count = len(frequent_items)
-            print(f"[CLS-DEBUG] 필터링 전: {before_count}개 / "
-                  f"블랙리스트 필터링 후: {after_count}개 "
-                  f"(차단 중: {len(self._decay_blacklist)}개)")
 
         if not frequent_items:
             return 0, []
@@ -145,8 +142,6 @@ class OnlineFrequencyChecker:
         # → 실질적인 "저빈도로 내려간 것처럼" 동작 → 재전환 유도
         for idx in decayed:
             self._decay_blacklist[idx] = grace_period
-        print(f"[CLS-DEBUG] 블랙리스트 등록: {len(decayed)}개 → {grace_period}배치 차단 "
-              f"(batch={current_batch})")
 
         return decayed
 
@@ -395,16 +390,6 @@ def batch_adaptive_encoding_with_hashing(
 
         # CLS: 전환 감지 및 임베딩 이전 (short_head_indices_set은 get_frequency_percentile에서 갱신됨)
         if transfer_module is not None:
-            # 블랙리스트 디버깅: 만료 직후 배치에서 current/prev 크기 확인
-            if (online_frequency_checker._decay_blacklist is not None
-                    and len(online_frequency_checker._decay_blacklist) == 0
-                    and iteration_index > 0):
-                prev_size = len(transfer_module._prev_short_head_set)
-                cur_size = len(short_head_indices_set)
-                diff = len(short_head_indices_set - transfer_module._prev_short_head_set)
-                if diff > 10:  # 의미있는 차이가 있을 때만 출력
-                    print(f"[CLS-DEBUG] batch={iteration_index} "
-                          f"current={cur_size} prev={prev_size} diff={diff}")
             newly_frequent = transfer_module.update(short_head_indices_set, device, iteration_index)
             if len(newly_frequent) > 0:
                 print(f"[CLS] 전환된 특성 수: {len(newly_frequent)}개 → 정보 이전 완료 (alpha={transfer_module.alpha:.2f})")

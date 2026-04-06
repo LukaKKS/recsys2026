@@ -186,14 +186,6 @@ class TransferModule:
         self.alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * progress
 
         newly_frequent = self.detect_transitions(current_short_head_set)
-
-        # decay 직후 구간(배치 9990~10200)에서 집합 크기 추적
-        if 9990 <= current_batch <= 10200:
-            print(f"[CLS-DEBUG] batch={current_batch} "
-                  f"current_set={len(current_short_head_set)} "
-                  f"prev_set={len(self._prev_short_head_set)} "
-                  f"newly_frequent={len(newly_frequent)}")
-
         self.transfer_embeddings(newly_frequent, device)
 
         # 다음 배치의 surge-k 해싱을 위해 전환 집합 보존
