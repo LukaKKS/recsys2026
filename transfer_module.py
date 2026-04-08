@@ -82,6 +82,10 @@ class TransferModule:
         # adaptive_encoding에서 surge-k 해싱에 사용
         self.newly_frequent: Set[int] = set()
 
+        # Adaptive Dynamic SMED: AUC 트렌드 기반 decay 활성화 제어
+        self.auc_window: list = []       # 최근 AUC 기록 (최대 3개)
+        self.decay_enabled: bool = True  # decay 활성화 여부
+
     # ------------------------------------------------------------------
     # 공개 메서드
     # ------------------------------------------------------------------
@@ -95,6 +99,29 @@ class TransferModule:
         (dlrm_s_pytorch.py 학습 루프에서 decayed 항목을 직접 차감)
         """
         return current_short_head_set - self._prev_short_head_set
+
+    def check_decay_effect(self, current_auc: float) -> None:
+        """테스트 AUC 기반으로 decay 활성화 여부를 결정 (Adaptive Dynamic SMED).
+
+        슬라이딩 윈도우(최근 3개)의 AUC 트렌드를 확인하여
+        AUC가 하락 추세(-0.0005 초과)이면 decay를 비활성화한다.
+
+        Parameters
+        ----------
+        current_auc : float
+            이번 테스트에서 측정된 ROC-AUC.
+        """
+        self.auc_window.append(current_auc)
+        if len(self.auc_window) > 3:
+            self.auc_window.pop(0)
+
+        if len(self.auc_window) >= 2:
+            trend = self.auc_window[-1] - self.auc_window[0]
+            self.decay_enabled = (trend >= -0.0005)
+            status = "활성" if self.decay_enabled else "비활성"
+            print(f"[CLS] AUC 트렌드: {trend:+.4f} "
+                  f"(window={[f'{a:.4f}' for a in self.auc_window]}) "
+                  f"→ decay {status}")
 
     def remove_from_prev_set(self, decayed: Set[int]) -> None:
         """decay된 항목만 _prev_short_head_set에서 제거.

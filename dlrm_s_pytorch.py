@@ -1131,6 +1131,7 @@ def inference(
         "nbatches_test": nbatches_test,
         "state_dict": dlrm.state_dict(),
         "test_acc": acc_test,
+        "current_auc": validation_results["roc_auc"],  # 현재 AUC (Adaptive SMED용)
     }
 
     is_best_auc = validation_results["roc_auc"] > best_metric[1]
@@ -1993,10 +1994,12 @@ def run():
 
                     # Dynamic SMED decay: short_head_indices_set에서
                     # 저빈도 항목을 주기적으로 제거 → 재전환 유도
+                    # Adaptive Dynamic SMED: AUC 트렌드 기반으로 decay 활성화 여부 결정
                     if (
                         args.use_cls
                         and online_frequency_checker is not None
                         and transfer_module is not None
+                        and transfer_module.decay_enabled  # AUC 트렌드 체크
                     ):
                         decayed = online_frequency_checker.apply_decay(
                             short_head_indices_set=short_head_indices_set,
@@ -2116,7 +2119,7 @@ def run():
                             "Testing at - {}/{} of epoch {},".format(
                                 j + 1, nbatches, k)
                         )
-                        model_metrics_dict, is_best_acc, _ = inference(
+                        model_metrics_dict, is_best_acc, is_best_auc = inference(
                             args,
                             dlrm,
                             best_metric,
@@ -2148,6 +2151,12 @@ def run():
                             args.frequency_percentile,
                             short_head_indices_set
                         )
+
+                        # Adaptive Dynamic SMED: 현재 테스트 AUC로 decay 효과 판단
+                        if args.use_cls and transfer_module is not None:
+                            transfer_module.check_decay_effect(
+                                model_metrics_dict["current_auc"]
+                            )
 
                         if (
                             is_best_acc
