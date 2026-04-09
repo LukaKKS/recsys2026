@@ -1063,7 +1063,8 @@ def compute_coldstart_auc(
                 lS_o_f = [o.to(device) for o in lS_o_f]
                 lS_i_f = [i.to(device) for i in lS_i_f]
 
-            Z_f = dlrm(X_f, lS_o_f, lS_i_f, test=True, train_time=False)
+            train_time = [0.0]  # sequential_forward에서 list item 할당 필요
+            Z_f = dlrm(X_f, lS_o_f, lS_i_f, test=True, train_time=train_time)
             all_scores.append(Z_f.detach().cpu())
             all_targets.append(T_f.cpu())
 
