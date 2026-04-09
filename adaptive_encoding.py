@@ -28,6 +28,8 @@ class OnlineFrequencyChecker:
         # {idx: remaining_batches_on_blacklist}
         # datasketches는 카운터 직접 수정 불가 → 블랙리스트로 재진입을 제어
         self._decay_blacklist: Dict[int, int] = {}
+        # LEAF 베이스라인 전환 추적용: 이전 배치의 숏헤드 집합
+        self._prev_sh_set: set = set()
 
     def add_elements(self, elements):
         for item in elements:
@@ -393,8 +395,17 @@ def batch_adaptive_encoding_with_hashing(
             newly_frequent = transfer_module.update(short_head_indices_set, device, iteration_index)
             if len(newly_frequent) > 0:
                 print(f"[CLS] 전환된 특성 수: {len(newly_frequent)}개 → 정보 이전 완료 (alpha={transfer_module.alpha:.2f})")
+        else:
+            # LEAF 베이스라인: 임베딩 이전 없이 전환 추적만 수행 (coldstart AUC 측정용)
+            newly_frequent = set(short_head_indices_set) - online_frequency_checker._prev_sh_set
+            online_frequency_checker._prev_sh_set = set(short_head_indices_set)
     else:
+        newly_frequent = set()
         result = long_tail_operation(emb_indices, long_tail_hashing)
+
+    # 전환된 특성 집합을 함수 속성에 저장 → 학습 루프에서 공통으로 읽을 수 있음
+    # (transfer_module 없는 LEAF 베이스라인 포함)
+    batch_adaptive_encoding_with_hashing.last_newly_frequent = newly_frequent
 
     sparse_indices, offsets = get_indices_and_offsets(result.T)
 

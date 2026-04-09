@@ -1001,6 +1001,97 @@ def dash_separated_floats(value):
     return value
 
 
+def compute_coldstart_auc(
+    dlrm,
+    test_ld,
+    newly_frequent_global_indices: set,
+    device,
+    use_gpu: bool,
+    min_samples: int = 100,
+) -> float:
+    """전환된 특성이 포함된 테스트 샘플만 필터링해 AUC를 측정한다.
+
+    LEAF와 CLS-LEAF의 Cold Start 차이를 정량화하기 위한 함수.
+    전환 직후 해당 특성을 포함한 샘플에서:
+      - LEAF: 임베딩을 버렸으므로 AUC 낮음
+      - CLS-LEAF: 임베딩을 이전했으므로 AUC 높음
+
+    Parameters
+    ----------
+    newly_frequent_global_indices : set
+        이번 배치에서 롱테일 → 숏헤드로 전환된 글로벌 특성 인덱스 집합.
+    min_samples : int
+        이 수보다 적은 샘플이 필터링되면 측정을 스킵한다.
+    """
+    if not newly_frequent_global_indices:
+        return None
+
+    target_tensor = torch.tensor(
+        list(newly_frequent_global_indices), dtype=torch.long
+    )
+
+    all_scores = []
+    all_targets = []
+
+    dlrm.eval()
+    with torch.no_grad():
+        for testBatch in test_ld:
+            X_test, lS_o_test, lS_i_test, T_test, W_test, CBPP_test = unpack_batch(
+                testBatch
+            )
+            batch_size = T_test.shape[0]
+
+            # 전환 특성이 포함된 샘플 마스크 생성
+            # lS_i_test: list of 1-D tensors, 각 필드의 인덱스 (batch_size,)
+            mask = torch.zeros(batch_size, dtype=torch.bool)
+            for field_indices in lS_i_test:
+                fi = field_indices.view(-1)  # (batch_size,)
+                mask |= torch.isin(fi, target_tensor)
+
+            if mask.sum() == 0:
+                continue
+
+            # 마스크된 샘플만 추출
+            X_f = X_test[mask] if X_test is not None else None
+            lS_o_f = [o[mask] for o in lS_o_test]
+            lS_i_f = [i[mask] for i in lS_i_test]
+            T_f = T_test[mask]
+
+            if use_gpu:
+                if X_f is not None:
+                    X_f = X_f.to(device)
+                lS_o_f = [o.to(device) for o in lS_o_f]
+                lS_i_f = [i.to(device) for i in lS_i_f]
+
+            Z_f = dlrm(X_f, lS_o_f, lS_i_f, test=True, train_time=False)
+            all_scores.append(Z_f.detach().cpu())
+            all_targets.append(T_f.cpu())
+
+    dlrm.train()
+
+    if not all_scores:
+        return None
+
+    scores_np = torch.cat(all_scores).numpy().flatten()
+    targets_np = torch.cat(all_targets).numpy().flatten()
+    n_samples = len(targets_np)
+
+    if n_samples < min_samples:
+        return None
+    if len(np.unique(targets_np)) < 2:
+        return None
+
+    auc = sklearn.metrics.roc_auc_score(targets_np, scores_np)
+    print(
+        f"[COLDSTART AUC] "
+        f"전환특성수={len(newly_frequent_global_indices)} "
+        f"포함샘플수={n_samples} "
+        f"AUC={auc:.4f}",
+        flush=True,
+    )
+    return auc
+
+
 def inference(
     args,
     dlrm,
@@ -1991,6 +2082,23 @@ def run():
                         transfer_module=transfer_module,
                         surge_long_tail_hash=surge_long_tail_hash,
                     )
+
+                    # Cold Start AUC: 전환된 특성 포함 샘플만 골라 AUC 측정
+                    # use_cls 유무에 관계없이 전환이 발생했으면 측정
+                    if args.use_adaptive_encoding and test_ld is not None:
+                        _newly_freq = getattr(
+                            ae.batch_adaptive_encoding_with_hashing,
+                            "last_newly_frequent",
+                            set(),
+                        )
+                        if _newly_freq:
+                            compute_coldstart_auc(
+                                dlrm=dlrm,
+                                test_ld=test_ld,
+                                newly_frequent_global_indices=_newly_freq,
+                                device=device,
+                                use_gpu=use_gpu,
+                            )
 
                     # Dynamic SMED decay: short_head_indices_set에서
                     # 저빈도 항목을 주기적으로 제거 → 재전환 유도
