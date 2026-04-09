@@ -1026,7 +1026,8 @@ def compute_coldstart_auc(
     if not newly_frequent_global_indices:
         return None
 
-    target_tensor = torch.tensor(
+    # 비교 기준 텐서는 CPU에서 생성 (isin 비교 시 device 통일)
+    newly_frequent_tensor = torch.tensor(
         list(newly_frequent_global_indices), dtype=torch.long
     )
 
@@ -1041,32 +1042,46 @@ def compute_coldstart_auc(
             )
             batch_size = T_test.shape[0]
 
-            # 전환 특성이 포함된 샘플 마스크 생성
-            # lS_i_test: list of 1-D tensors, 각 필드의 인덱스 (batch_size,)
+            # 전환 특성이 포함된 샘플 마스크 (CPU에서 계산)
             mask = torch.zeros(batch_size, dtype=torch.bool)
-            for field_indices in lS_i_test:
-                fi = field_indices.view(-1)  # (batch_size,)
-                mask |= torch.isin(fi, target_tensor)
+            for field_i in lS_i_test:
+                mask |= torch.isin(field_i.cpu().view(-1), newly_frequent_tensor)
 
             if mask.sum() == 0:
                 continue
 
-            # 마스크된 샘플만 추출
-            X_f = X_test[mask] if X_test is not None else None
-            lS_o_f = [o[mask] for o in lS_o_test]
-            lS_i_f = [i[mask] for i in lS_i_test]
-            T_f = T_test[mask]
+            masked_idx = mask.nonzero(as_tuple=True)[0]  # 1-D 정수 인덱스
+
+            # lS_i: 마스크된 샘플만 슬라이싱
+            filtered_lS_i = [field_i[masked_idx] for field_i in lS_i_test]
+
+            # lS_o: EmbeddingBag offset은 각 샘플의 시작 위치
+            # 1개 lookup / 샘플 구조이므로 0, 1, 2, ... 로 재생성
+            n_filtered = len(masked_idx)
+            filtered_lS_o = [
+                torch.arange(n_filtered, dtype=torch.long)
+                for _ in lS_o_test
+            ]
+
+            filtered_X = X_test[masked_idx] if X_test is not None else None
+            filtered_T = T_test[masked_idx]
 
             if use_gpu:
-                if X_f is not None:
-                    X_f = X_f.to(device)
-                lS_o_f = [o.to(device) for o in lS_o_f]
-                lS_i_f = [i.to(device) for i in lS_i_f]
+                filtered_lS_i = [i.to(device) for i in filtered_lS_i]
+                filtered_lS_o = [o.to(device) for o in filtered_lS_o]
+                if filtered_X is not None:
+                    filtered_X = filtered_X.to(device)
 
             train_time = [0.0]  # sequential_forward에서 list item 할당 필요
-            Z_f = dlrm(X_f, lS_o_f, lS_i_f, test=True, train_time=train_time)
+            Z_f = dlrm(
+                filtered_X,
+                filtered_lS_o,
+                filtered_lS_i,
+                test=True,
+                train_time=train_time,
+            )
             all_scores.append(Z_f.detach().cpu())
-            all_targets.append(T_f.cpu())
+            all_targets.append(filtered_T.cpu())
 
     dlrm.train()
 
