@@ -2152,6 +2152,14 @@ def run():
                             short_head_indices_set
                         )
 
+                        # Cold Start 시각화용 로그 (--test-freq=1 시 매 배치 출력)
+                        print(
+                            f"[COLDSTART] batch={j + 1} "
+                            f"auc={model_metrics_dict['current_auc']:.4f} "
+                            f"loss={train_loss:.4f}",
+                            flush=True,
+                        )
+
                         # Adaptive Dynamic SMED: 현재 테스트 AUC로 decay 효과 판단
                         if args.use_cls and transfer_module is not None:
                             transfer_module.check_decay_effect(
