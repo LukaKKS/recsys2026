@@ -1002,11 +1002,11 @@ def dash_separated_floats(value):
 
 
 def compute_coldstart_auc(
+    forward_fn,
     dlrm,
     test_ld,
     newly_frequent_global_indices: set,
     device,
-    use_gpu: bool,
     min_samples: int = 100,
 ) -> float:
     """전환된 특성이 포함된 테스트 샘플만 필터링해 AUC를 측정한다.
@@ -1018,18 +1018,20 @@ def compute_coldstart_auc(
 
     Parameters
     ----------
+    forward_fn : callable(X, lS_o, lS_i) -> score tensor
+        dlrm_wrap을 올바른 인코딩 파라미터로 감싼 함수.
+        raw 인덱스 → 인코딩 → 모델 추론을 일관되게 처리한다.
     newly_frequent_global_indices : set
-        이번 배치에서 롱테일 → 숏헤드로 전환된 글로벌 특성 인덱스 집합.
+        최근 전환된 글로벌 특성 인덱스 집합.
     min_samples : int
         이 수보다 적은 샘플이 필터링되면 측정을 스킵한다.
     """
     if not newly_frequent_global_indices:
         return None
 
-    # 비교 기준 텐서는 CPU에서 생성 (isin 비교 시 device 통일)
     newly_frequent_tensor = torch.tensor(
         list(newly_frequent_global_indices), dtype=torch.long
-    )
+    )  # CPU 텐서로 isin 비교
 
     all_scores = []
     all_targets = []
@@ -1040,48 +1042,23 @@ def compute_coldstart_auc(
             X_test, lS_o_test, lS_i_test, T_test, W_test, CBPP_test = unpack_batch(
                 testBatch
             )
-            batch_size = T_test.shape[0]
 
-            # 전환 특성이 포함된 샘플 마스크 (CPU에서 계산)
-            mask = torch.zeros(batch_size, dtype=torch.bool)
+            # 전환 특성 포함 샘플 마스크 (CPU)
+            mask = torch.zeros(T_test.shape[0], dtype=torch.bool)
             for field_i in lS_i_test:
                 mask |= torch.isin(field_i.cpu().view(-1), newly_frequent_tensor)
 
-            if mask.sum() == 0:
+            if not mask.any():
                 continue
 
-            masked_idx = mask.nonzero(as_tuple=True)[0]  # 1-D 정수 인덱스
+            # 전체 배치를 forward_fn으로 실행
+            # → dlrm_wrap이 올바른 인코딩(adaptive encoding) 적용
+            # → 필터링 전 raw 인덱스를 그대로 넣어 index-out-of-range 방지
+            Z = forward_fn(X_test, lS_o_test, lS_i_test)
 
-            # lS_i: 마스크된 샘플만 슬라이싱
-            filtered_lS_i = [field_i[masked_idx] for field_i in lS_i_test]
-
-            # lS_o: EmbeddingBag offset은 각 샘플의 시작 위치
-            # 1개 lookup / 샘플 구조이므로 0, 1, 2, ... 로 재생성
-            n_filtered = len(masked_idx)
-            filtered_lS_o = [
-                torch.arange(n_filtered, dtype=torch.long)
-                for _ in lS_o_test
-            ]
-
-            filtered_X = X_test[masked_idx] if X_test is not None else None
-            filtered_T = T_test[masked_idx]
-
-            if use_gpu:
-                filtered_lS_i = [i.to(device) for i in filtered_lS_i]
-                filtered_lS_o = [o.to(device) for o in filtered_lS_o]
-                if filtered_X is not None:
-                    filtered_X = filtered_X.to(device)
-
-            train_time = [0.0]  # sequential_forward에서 list item 할당 필요
-            Z_f = dlrm(
-                filtered_X,
-                filtered_lS_o,
-                filtered_lS_i,
-                test=True,
-                train_time=train_time,
-            )
-            all_scores.append(Z_f.detach().cpu())
-            all_targets.append(filtered_T.cpu())
+            # 전환 특성 포함 샘플의 출력만 필터링
+            all_scores.append(Z.detach().cpu()[mask])
+            all_targets.append(T_test[mask].cpu())
 
     dlrm.train()
 
@@ -1092,9 +1069,7 @@ def compute_coldstart_auc(
     targets_np = torch.cat(all_targets).numpy().flatten()
     n_samples = len(targets_np)
 
-    if n_samples < min_samples:
-        return None
-    if len(np.unique(targets_np)) < 2:
+    if n_samples < min_samples or len(np.unique(targets_np)) < 2:
         return None
 
     auc = sklearn.metrics.roc_auc_score(targets_np, scores_np)
@@ -1560,6 +1535,8 @@ def run():
         short_head_hash = None
         surge_long_tail_hash = None
         short_head_indices_set = set()
+        # coldstart AUC 측정용: 마지막 테스트 이후 전환된 특성 누적
+        accumulated_newly_frequent: set = set()
 
         if args.use_adaptive_encoding:
             selected_ln_emb = ln_emb[compressed_table_mask]
@@ -2099,22 +2076,14 @@ def run():
                         surge_long_tail_hash=surge_long_tail_hash,
                     )
 
-                    # Cold Start AUC: 전환된 특성 포함 샘플만 골라 AUC 측정
-                    # use_cls 유무에 관계없이 전환이 발생했으면 측정
-                    if args.use_adaptive_encoding and test_ld is not None:
-                        _newly_freq = getattr(
+                    # Cold Start AUC: 전환 특성 누적 (should_test 시점에 일괄 측정)
+                    if args.use_adaptive_encoding:
+                        _batch_newly_freq = getattr(
                             ae.batch_adaptive_encoding_with_hashing,
                             "last_newly_frequent",
                             set(),
                         )
-                        if _newly_freq:
-                            compute_coldstart_auc(
-                                dlrm=dlrm,
-                                test_ld=test_ld,
-                                newly_frequent_global_indices=_newly_freq,
-                                device=device,
-                                use_gpu=use_gpu,
-                            )
+                        accumulated_newly_frequent |= _batch_newly_freq
 
                     # Dynamic SMED decay: short_head_indices_set에서
                     # 저빈도 항목을 주기적으로 제거 → 재전환 유도
@@ -2283,6 +2252,49 @@ def run():
                             f"loss={train_loss:.4f}",
                             flush=True,
                         )
+
+                        # Cold Start AUC: 마지막 테스트 이후 전환된 특성 포함 샘플 AUC
+                        # dlrm_wrap을 통해 adaptive encoding 적용 → index 범위 오류 방지
+                        if args.use_adaptive_encoding and accumulated_newly_frequent:
+                            def _cs_forward(X_in, lS_o_in, lS_i_in):
+                                return dlrm_wrap(
+                                    X_in, lS_o_in, lS_i_in,
+                                    use_gpu, device, ndevices,
+                                    True,   # test=True
+                                    args.sketch_flag,
+                                    args.use_huffman_coding,
+                                    huffman_coding_tensors,
+                                    max_lens,
+                                    ln_emb,
+                                    capacity,
+                                    args.use_hashing_trick,
+                                    args.is_coding_reversed,
+                                    args.reverse_and_shift_huffman_coding,
+                                    args.num_huffman_digits,
+                                    args.use_adaptive_encoding,
+                                    online_frequency_checker,
+                                    compressed_table_mask,
+                                    selected_ln_emb_cum_offsets,
+                                    args.use_hash_embedding,
+                                    hash_embeddings,
+                                    args.num_buckets,
+                                    short_head_hash,
+                                    long_tail_hash,
+                                    j,
+                                    args.frequency_percentile,
+                                    short_head_indices_set=short_head_indices_set,
+                                    train_time=[0.0],
+                                    transfer_module=None,       # 테스트 중 상태 변경 방지
+                                    surge_long_tail_hash=None,
+                                )
+                            compute_coldstart_auc(
+                                forward_fn=_cs_forward,
+                                dlrm=dlrm,
+                                test_ld=test_ld,
+                                newly_frequent_global_indices=accumulated_newly_frequent,
+                                device=device,
+                            )
+                            accumulated_newly_frequent = set()  # 측정 후 초기화
 
                         # Adaptive Dynamic SMED: 현재 테스트 AUC로 decay 효과 판단
                         if args.use_cls and transfer_module is not None:
