@@ -15,11 +15,11 @@ CUDA_VISIBLE_DEVICES=0 python dlrm_s_pytorch.py \
   --round-targets=True \
   --learning-rate=0.1 \
   --mini-batch-size=128 \
-  --print-freq=1 \
-  --test-freq=1 \
+  --print-freq=1024 \
+  --test-freq=1024 \
   --nepochs=1 \
   --print-time \
-  --test-mini-batch-size=4096 \
+  --test-mini-batch-size=16384 \
   --test-num-workers=0 \
   --cat-path="./input/avazu_cat.bin" \
   --dense-path="" \
@@ -29,7 +29,7 @@ CUDA_VISIBLE_DEVICES=0 python dlrm_s_pytorch.py \
   --use-adaptive-encoding \
   --compression-ratio=100 \
   --long-tail-memory-ratio=0.9 \
-  --num-batches=500 \
+  --num-batches=50000 \
   --use-cls \
   --cls-alpha-min=0.1 \
   --cls-alpha-max=0.9 \
