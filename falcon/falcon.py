@@ -327,28 +327,26 @@ class FALCONEncoder:
             for card, budget in zip(field_cardinalities, self.field_budgets)
         ]
 
-        # field별 global cumulative offset (avazu field 값이 field-local 0-indexed이므로
-        # global index로 변환하기 위한 offset)
-        self.field_global_offsets: List[int] = []
-        cumulative = 0
-        for card in field_cardinalities:
-            self.field_global_offsets.append(cumulative)
-            cumulative += card
-        self.total_input_space = cumulative
-
         # 각 field별 HashEmbedding 생성
-        # 각 HashEmbedding은 [0, M_f-1] 범위를 출력
+        # FALCON은 field별 독립 EmbeddingBag(크기 M_f)을 사용하므로
+        # HashEmbedding의 출력 인덱스는 반드시 [0, M_f-1] 범위여야 한다.
+        # → offsets=0 (출력 시프트 없음)
+        #
+        # LEAF의 shared-table 방식과 달리, FALCON은 field별 테이블을 분리하므로
+        # offsets로 shared table 내 위치를 지정할 필요가 없다.
+        # HashEmbedding의 hash 함수 파라미터(multiplers, adders)가
+        # field별로 달라지므로 같은 raw 값도 다른 bucket으로 해싱된다.
         self.field_hash_embeddings: List[HashEmbedding] = []
         for i, (card, budget, k) in enumerate(
             zip(field_cardinalities, self.field_budgets, self.field_k)
         ):
             he = HashEmbedding(
-                self.total_input_space,      # 전체 input space
+                card,                   # field의 카디널리티 (input space = 해당 field만)
                 arch_sparse_feature_size,
-                num_buckets=budget,          # field별 독립 bucket 수
+                num_buckets=budget,     # field별 독립 bucket 수 M_f
                 num_hashes=k,
                 append_weight=False,
-                offsets=self.field_global_offsets[i],  # field-local → global 변환
+                offsets=0,              # 출력 인덱스 [0, M_f-1] 그대로 유지
                 device=self.device,
             )
             self.field_hash_embeddings.append(he)
@@ -407,11 +405,25 @@ class FALCONEncoder:
             hashed = self.encode_field(field_idx, raw_idx)  # [k_f, batch_size]
             k_f, batch_size = hashed.shape
 
+            # 인덱스 범위 검증 (첫 10배치에서만)
+            if self.batch_count < 10:
+                M_f = self.field_budgets[field_idx]
+                h_min, h_max = int(hashed.min()), int(hashed.max())
+                if h_max >= M_f or h_min < 0:
+                    print(
+                        f"[FALCON WARNING] Field {field_idx}: "
+                        f"hash index out of range! "
+                        f"min={h_min}, max={h_max}, M_f={M_f}",
+                        flush=True,
+                    )
+
             # EmbeddingBag 형식: 각 샘플의 k_f개 hash를 하나의 bag으로
-            flat_indices = hashed.T.reshape(-1).to(dev)        # [batch_size * k_f]
+            # flat_indices: [batch_size * k_f] — 각 샘플의 k_f개 bucket 인덱스
+            # offsets:      [batch_size]       — 각 샘플의 시작 위치 (0, k_f, 2k_f, ...)
+            flat_indices = hashed.T.reshape(-1).to(dev)
             offsets = torch.arange(
                 0, batch_size * k_f, k_f, dtype=torch.long, device=dev
-            )  # [batch_size]
+            )
 
             encoded_indices.append(flat_indices)
             encoded_offsets.append(offsets)
