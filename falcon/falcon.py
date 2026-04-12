@@ -18,7 +18,6 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
-from collections import Counter
 from typing import List, Dict, Optional, Tuple
 
 from datasketches import frequent_items_sketch, frequent_items_error_type
@@ -32,89 +31,30 @@ from hash_embedding import HashEmbedding
 class FieldPressureEstimator:
     """각 field의 compression pressure 계산.
 
-    Pressure_f = α·log(|X_f|) + β·skew_f + γ·(1 - mass_f)
+    학습 전 카디널리티만으로 pressure를 계산하고 이후 고정.
+    학습 중 추가 연산 없음 (zero training overhead).
 
-    초기 버전은 카디널리티 기반 정규화:
-        P_f = log(|X_f|) / Σ log(|X_i|)
-    학습이 진행되면서 skewness와 mass를 반영해 pressure를 조정한다.
+        pressure_f = log(|X_f|) / Σ log(|X_i|)
+
+    논문 메시지: "compression policy는 학습 전 field 통계로부터
+    자동 유도되며 학습 중 추가 연산이 없다."
     """
-
-    ALPHA = 0.5   # cardinality 가중치
-    BETA  = 0.3   # skewness 가중치
-    GAMMA = 0.2   # tail-mass 가중치
-    UPDATE_INTERVAL = 1000  # 몇 배치마다 skew/mass 재계산
 
     def __init__(self, field_cardinalities: List[int]):
         self.cardinalities = field_cardinalities
         self.n_fields = len(field_cardinalities)
 
-        # 기본 pressure: 정규화된 log(cardinality)
+        # 초기화 시 1회만 계산, 이후 고정
         log_cards = [math.log(max(c, 2)) for c in field_cardinalities]
         total_log = sum(log_cards)
-        self._base_pressures: List[float] = [lc / total_log for lc in log_cards]
-
-        # 빈도 카운터 (skewness/mass 추정용)
-        self._counters: List[Counter] = [Counter() for _ in range(self.n_fields)]
-        self._update_counts: List[int] = [0] * self.n_fields
-
-        # 조정된 pressure (skew/mass 반영 후)
-        self._adjusted_pressures: List[float] = list(self._base_pressures)
+        self._pressures: List[float] = [lc / total_log for lc in log_cards]
 
     # ------------------------------------------------------------------
     def compute_pressure(self, field_idx: int) -> float:
-        return self._adjusted_pressures[field_idx]
+        return self._pressures[field_idx]
 
     def get_all_pressures(self) -> List[float]:
-        return list(self._adjusted_pressures)
-
-    # ------------------------------------------------------------------
-    def update_statistics(self, field_idx: int, field_values) -> None:
-        """배치에서 field 값들의 빈도 분포 업데이트."""
-        for v in field_values:
-            self._counters[field_idx][int(v)] += 1
-        self._update_counts[field_idx] += 1
-
-        if self._update_counts[field_idx] % self.UPDATE_INTERVAL == 0:
-            self._recompute_pressure(field_idx)
-
-    # ------------------------------------------------------------------
-    def _recompute_pressure(self, field_idx: int) -> None:
-        """skewness와 mass를 반영해 pressure 재계산 후 전체 정규화."""
-        counter = self._counters[field_idx]
-        if len(counter) < 2:
-            return
-
-        counts = np.array(list(counter.values()), dtype=float)
-        mean, std = counts.mean(), counts.std()
-        if std < 1e-8:
-            return
-
-        # skewness (간단한 근사)
-        skewness = float(np.mean(((counts - mean) / std) ** 3))
-
-        # mass: 상위 10% 특성이 차지하는 빈도 비율
-        sorted_counts = np.sort(counts)[::-1]
-        top_n = max(1, len(sorted_counts) // 10)
-        mass = float(sorted_counts[:top_n].sum() / counts.sum())
-
-        log_card = math.log(max(self.cardinalities[field_idx], 2))
-        raw = (
-            self.ALPHA * log_card
-            + self.BETA  * abs(skewness)
-            + self.GAMMA * (1.0 - mass)
-        )
-
-        # 해당 field만 업데이트하고 전체 재정규화
-        raw_all = []
-        for i in range(self.n_fields):
-            if i == field_idx:
-                raw_all.append(raw)
-            else:
-                lc = math.log(max(self.cardinalities[i], 2))
-                raw_all.append(self.ALPHA * lc)   # 나머지는 기본값 사용
-        total = sum(raw_all)
-        if total > 0:
-            self._adjusted_pressures = [r / total for r in raw_all]
+        return list(self._pressures)
 
 
 # ---------------------------------------------------------------------------
@@ -407,8 +347,7 @@ class FALCONEncoder:
         for field_idx, raw_idx in enumerate(batch_cat_features):
             raw_np = raw_idx.cpu().numpy()
 
-            # SMED 및 pressure 업데이트
-            self.pressure_estimator.update_statistics(field_idx, raw_np)
+            # SMED 업데이트 (고빈도 분류용, pressure/budget/k는 학습 중 불변)
             self.field_smed.update(field_idx, raw_np)
 
             # [k_f, batch_size] → flatten
