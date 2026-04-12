@@ -206,56 +206,54 @@ class FALCONEncoder:
 
         # 초기 pressure로 budget 계산
         pressures = self.pressure_estimator.get_all_pressures()
-        self.field_budgets: List[int] = self.budget_allocator.allocate(pressures)
+        raw_budgets = self.budget_allocator.allocate(pressures)
 
-        # 각 field별 최적 k 계산
-        self.field_k: List[int] = [
-            self.k_selector.compute_optimal_k(card, budget)
+        # 여유 field (card ≤ 배분된 budget)는 자연 크기(card)로 고정
+        # → 압축 불필요, EmbeddingBag 낭비 없음
+        self.field_budgets: List[int] = [
+            min(card, budget)
+            for card, budget in zip(field_cardinalities, raw_budgets)
+        ]
+
+        # 압축 필요 여부: card > M_f 인 field만 HashEmbedding 사용
+        # 여유 field: raw indices 직접 통과 (LEAF baseline과 동일 속도)
+        self.compressed_mask: List[bool] = [
+            card > budget
             for card, budget in zip(field_cardinalities, self.field_budgets)
         ]
 
-        # 각 field별 HashEmbedding 생성
-        # FALCON은 field별 독립 EmbeddingBag(크기 M_f)을 사용하므로
-        # HashEmbedding의 출력 인덱스는 반드시 [0, M_f-1] 범위여야 한다.
-        # → offsets=0 (출력 시프트 없음)
-        #
-        # LEAF의 shared-table 방식과 달리, FALCON은 field별 테이블을 분리하므로
-        # offsets로 shared table 내 위치를 지정할 필요가 없다.
-        # HashEmbedding의 hash 함수 파라미터(multiplers, adders)가
-        # field별로 달라지므로 같은 raw 값도 다른 bucket으로 해싱된다.
-        self.field_hash_embeddings: List[HashEmbedding] = []
-        for i, (card, budget, k) in enumerate(
-            zip(field_cardinalities, self.field_budgets, self.field_k)
+        # 각 field별 최적 k 계산 (압축 field만 의미 있음)
+        self.field_k: List[int] = [
+            self.k_selector.compute_optimal_k(card, budget) if compressed else 1
+            for card, budget, compressed in zip(
+                field_cardinalities, self.field_budgets, self.compressed_mask
+            )
+        ]
+
+        n_compressed = sum(self.compressed_mask)
+        print(
+            f"[FALCON] 압축 대상 field: {n_compressed}/{self.n_fields}개 "
+            f"(나머지 {self.n_fields - n_compressed}개는 raw indices 통과)"
+        )
+
+        # 압축 field에 대해서만 HashEmbedding 생성
+        # → 여유 field는 encode()에서 raw indices를 직접 반환
+        self.field_hash_embeddings: Dict[int, HashEmbedding] = {}
+        for i, (card, budget, k, compressed) in enumerate(
+            zip(field_cardinalities, self.field_budgets, self.field_k, self.compressed_mask)
         ):
+            if not compressed:
+                continue
             he = HashEmbedding(
-                card,                   # field의 카디널리티 (input space = 해당 field만)
+                card,
                 arch_sparse_feature_size,
-                num_buckets=budget,     # field별 독립 bucket 수 M_f
+                num_buckets=budget,
                 num_hashes=k,
                 append_weight=False,
-                offsets=0,              # 출력 인덱스 [0, M_f-1] 그대로 유지
+                offsets=0,
                 device=self.device,
             )
-            self.field_hash_embeddings.append(he)
-
-        self.batch_count: int = 0
-
-    # ------------------------------------------------------------------
-    def encode_field(
-        self, field_idx: int, local_indices: torch.Tensor
-    ) -> torch.Tensor:
-        """단일 field의 local 인덱스를 hash bucket 인덱스로 변환.
-
-        Parameters
-        ----------
-        local_indices : (n,) 텐서 — field-local 0-indexed 값
-
-        Returns
-        -------
-        (k_f, n) 텐서 — hash bucket 인덱스 (0 ~ M_f-1)
-        """
-        he = self.field_hash_embeddings[field_idx]
-        return he.get_hash_embedding_tensors(local_indices.to(self.device))
+            self.field_hash_embeddings[i] = he
 
     # ------------------------------------------------------------------
     def encode(
@@ -265,51 +263,44 @@ class FALCONEncoder:
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """전체 배치 인코딩.
 
+        압축 field (card > M_f): adaptive k-hash → flat_indices + k-step offsets
+        여유 field (card ≤ M_f): raw indices 직접 통과 → EmbeddingBag 1-index-per-sample
+
         Parameters
         ----------
         batch_cat_features : list[Tensor(batch_size,)]
-            field별 raw(local) 인덱스 텐서 리스트.
+            field별 raw(local, 0-indexed) 인덱스 텐서 리스트.
 
         Returns
         -------
-        encoded_indices : list[Tensor(batch_size * k_f,)]
-            field별 flatten된 hash bucket 인덱스.
-        encoded_offsets : list[Tensor(batch_size,)]
-            field별 EmbeddingBag offset (0, k_f, 2k_f, ...).
+        encoded_indices : list[Tensor]
+        encoded_offsets : list[Tensor]
         """
         dev = device or self.device
         encoded_indices: List[torch.Tensor] = []
         encoded_offsets: List[torch.Tensor] = []
 
+        # 여유 field 공용 offsets (1-index-per-sample): 배치마다 1회 생성
+        batch_size = batch_cat_features[0].shape[0]
+        simple_offsets = torch.arange(batch_size, dtype=torch.long, device=dev)
+
         for field_idx, raw_idx in enumerate(batch_cat_features):
-            # [k_f, batch_size] → flatten
-            hashed = self.encode_field(field_idx, raw_idx)  # [k_f, batch_size]
-            k_f, batch_size = hashed.shape
+            if not self.compressed_mask[field_idx]:
+                # 여유 field: raw indices 그대로 통과 (HashEmbedding 스킵)
+                encoded_indices.append(raw_idx.to(dev))
+                encoded_offsets.append(simple_offsets)
+            else:
+                # 압축 field: adaptive k 해싱
+                he = self.field_hash_embeddings[field_idx]
+                hashed = he.get_hash_embedding_tensors(raw_idx.to(self.device))
+                k_f = hashed.shape[0]
+                flat_indices = hashed.T.reshape(-1).to(dev)
+                offsets = torch.arange(
+                    0, batch_size * k_f, k_f, dtype=torch.long, device=dev
+                )
+                encoded_indices.append(flat_indices)
+                encoded_offsets.append(offsets)
 
-            # 인덱스 범위 검증 (첫 10배치에서만)
-            if self.batch_count < 10:
-                M_f = self.field_budgets[field_idx]
-                h_min, h_max = int(hashed.min()), int(hashed.max())
-                if h_max >= M_f or h_min < 0:
-                    print(
-                        f"[FALCON WARNING] Field {field_idx}: "
-                        f"hash index out of range! "
-                        f"min={h_min}, max={h_max}, M_f={M_f}",
-                        flush=True,
-                    )
-
-            # EmbeddingBag 형식: 각 샘플의 k_f개 hash를 하나의 bag으로
-            # flat_indices: [batch_size * k_f] — 각 샘플의 k_f개 bucket 인덱스
-            # offsets:      [batch_size]       — 각 샘플의 시작 위치 (0, k_f, 2k_f, ...)
-            flat_indices = hashed.T.reshape(-1).to(dev)
-            offsets = torch.arange(
-                0, batch_size * k_f, k_f, dtype=torch.long, device=dev
-            )
-
-            encoded_indices.append(flat_indices)
-            encoded_offsets.append(offsets)
-
-        self.batch_count += 1
         return encoded_indices, encoded_offsets
 
     # ------------------------------------------------------------------
@@ -326,17 +317,18 @@ class FALCONEncoder:
             f"(M_total={self.M_total}, fields={self.n_fields})"
         )
         for i in range(self.n_fields):
-            # 로드 팩터 기반 P_col 수식 (AdaptiveKSelector와 동일)
             M_i = max(self.field_budgets[i], 1)
             k_i = self.field_k[i]
             card_i = max(self.field_cardinalities[i], 1)
             load_i = card_i / M_i
             p_col = max(0.0, math.log(load_i)) / k_i if load_i > 1.0 else 0.0
+            mode = "compress" if self.compressed_mask[i] else "raw-pass"
             print(
                 f"[FALCON] Field {i:2d}: "
                 f"card={self.field_cardinalities[i]:>12,}, "
-                f"k={self.field_k[i]:>2}, "
+                f"k={k_i:>2}, "
                 f"M={self.field_budgets[i]:>8,}, "
                 f"pressure={pressures[i]:.4f}, "
-                f"P_col≈{p_col:.4f}"
+                f"P_col≈{p_col:.4f}, "
+                f"mode={mode}"
             )
