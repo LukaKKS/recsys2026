@@ -1,26 +1,28 @@
 """
 FALCON: Field-Aware Lightweight COmpression with pressure-derived policy
 
-각 field의 통계적 특성(카디널리티, skewness, mass)을 분석해
-field마다 최적의 hash bucket 수(M_f)와 hash 함수 수(k_f)를 자동으로 결정한다.
+각 field의 카디널리티를 분석해 field마다 최적의 hash bucket 수(M_f)와
+hash 함수 수(k_f)를 학습 전 1회 계산하고 학습 중에는 추가 연산 없이
+field별 adaptive k로 직접 해싱한다.
+
+Zero training overhead:
+    pressure / budget / k → 초기화 시 카디널리티 기반 1회 계산, 이후 고정.
+    학습 중에는 field별 HashEmbedding으로 직접 해싱만 수행.
 
 Components:
-    FieldPressureEstimator  : field별 compression pressure 계산
-    FieldWiseSMED           : field별 독립 빈도 스케치
-    AdaptiveKSelector       : field별 최적 k (hash 수) 결정
-    BudgetAllocator         : pressure 기반 메모리 배분
+    FieldPressureEstimator  : field별 compression pressure 계산 (초기화 시 1회)
+    AdaptiveKSelector       : field별 최적 k (hash 수) 결정 (초기화 시 1회)
+    BudgetAllocator         : pressure 기반 메모리 배분 (초기화 시 1회)
     FALCONEncoder           : 전체 FALCON 파이프라인
 """
 
 from __future__ import annotations
 
 import math
-import numpy as np
 import torch
 import torch.nn as nn
 from typing import List, Dict, Optional, Tuple
 
-from datasketches import frequent_items_sketch, frequent_items_error_type
 from hash_embedding import HashEmbedding
 
 
@@ -58,70 +60,7 @@ class FieldPressureEstimator:
 
 
 # ---------------------------------------------------------------------------
-# 2. FieldWiseSMED
-# ---------------------------------------------------------------------------
-
-class FieldWiseSMED:
-    """field마다 독립적인 SMED (Sketch-based Memory-Efficient Dictionary) sketch.
-
-    K_f = K_base × max(1, int(log2(|X_f|)))
-    """
-
-    def __init__(self, field_cardinalities: List[int], K_base: int = 256):
-        self.n_fields = len(field_cardinalities)
-        self.cardinalities = field_cardinalities
-        self.K_base = K_base
-
-        # 각 field별 K 계산
-        self.K_per_field: List[int] = []
-        for card in field_cardinalities:
-            log2_card = max(1, int(math.log2(max(card, 2))))
-            self.K_per_field.append(K_base * log2_card)
-
-        # 각 field별 독립 sketch
-        # lg_max_k = max(4, int(log2(K_f))) → sketch 용량
-        self.sketches: List[frequent_items_sketch] = []
-        for K_f in self.K_per_field:
-            lg_max_k = max(4, int(math.log2(max(K_f, 16))))
-            self.sketches.append(frequent_items_sketch(lg_max_k))
-
-        # field별 short-head 집합 (고빈도 특성)
-        self.short_head_sets: List[set] = [set() for _ in range(self.n_fields)]
-
-    # ------------------------------------------------------------------
-    def update(self, field_idx: int, field_values) -> None:
-        """해당 field의 sketch 업데이트."""
-        for v in field_values:
-            self.sketches[field_idx].update(int(v))
-
-    # ------------------------------------------------------------------
-    def get_frequent(
-        self, field_idx: int, percentile: float = 90.0
-    ) -> set:
-        """해당 field의 고빈도 feature 반환."""
-        sketch = self.sketches[field_idx]
-        items = sketch.get_frequent_items(
-            err_type=frequent_items_error_type.NO_FALSE_POSITIVES,
-            threshold=0,
-        )
-        if not items:
-            return set()
-        counts = [item[1] for item in items]
-        threshold = float(np.percentile(counts, percentile))
-        return {item[0] for item in items if item[1] >= threshold}
-
-    # ------------------------------------------------------------------
-    def get_frequency_estimation_error(self, field_idx: int) -> Dict:
-        """단일 sketch vs field-wise sketch 추정 오차 계산 (실험용)."""
-        return {
-            "field_idx": field_idx,
-            "active_items": self.sketches[field_idx].get_num_active_items(),
-            "K_f": self.K_per_field[field_idx],
-        }
-
-
-# ---------------------------------------------------------------------------
-# 3. AdaptiveKSelector
+# 2. AdaptiveKSelector
 # ---------------------------------------------------------------------------
 
 class AdaptiveKSelector:
@@ -252,7 +191,6 @@ class FALCONEncoder:
         M_total: int,
         arch_sparse_feature_size: int = 16,
         lambda_cost: float = 0.1,
-        K_base: int = 256,
         device: Optional[torch.device] = None,
     ):
         self.field_cardinalities = field_cardinalities
@@ -261,9 +199,8 @@ class FALCONEncoder:
         self.arch_sparse_feature_size = arch_sparse_feature_size
         self.device = device or torch.device("cpu")
 
-        # 구성 요소 초기화
+        # 구성 요소 초기화 (초기화 시 1회, 학습 중 불변)
         self.pressure_estimator = FieldPressureEstimator(field_cardinalities)
-        self.field_smed = FieldWiseSMED(field_cardinalities, K_base)
         self.k_selector = AdaptiveKSelector(lambda_cost)
         self.budget_allocator = BudgetAllocator(M_total, field_cardinalities)
 
@@ -345,11 +282,6 @@ class FALCONEncoder:
         encoded_offsets: List[torch.Tensor] = []
 
         for field_idx, raw_idx in enumerate(batch_cat_features):
-            raw_np = raw_idx.cpu().numpy()
-
-            # SMED 업데이트 (고빈도 분류용, pressure/budget/k는 학습 중 불변)
-            self.field_smed.update(field_idx, raw_np)
-
             # [k_f, batch_size] → flatten
             hashed = self.encode_field(field_idx, raw_idx)  # [k_f, batch_size]
             k_f, batch_size = hashed.shape
@@ -403,7 +335,6 @@ class FALCONEncoder:
             print(
                 f"[FALCON] Field {i:2d}: "
                 f"card={self.field_cardinalities[i]:>12,}, "
-                f"K={self.field_smed.K_per_field[i]:>6,}, "
                 f"k={self.field_k[i]:>2}, "
                 f"M={self.field_budgets[i]:>8,}, "
                 f"pressure={pressures[i]:.4f}, "

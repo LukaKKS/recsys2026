@@ -1451,12 +1451,6 @@ def run():
         help="FALCON: field-aware k 선택 + pressure 기반 budget 배분",
     )
     parser.add_argument(
-        "--falcon-K-base",
-        type=int,
-        default=256,
-        help="FALCON FieldWiseSMED: K_f = K_base × log2(|X_f|)",
-    )
-    parser.add_argument(
         "--falcon-lambda-cost",
         type=float,
         default=0.1,
@@ -1600,7 +1594,6 @@ def run():
                 M_total=M_total_falcon,
                 arch_sparse_feature_size=args.arch_sparse_feature_size,
                 lambda_cost=args.falcon_lambda_cost,
-                K_base=args.falcon_K_base,
                 device=device,
             )
             falcon_encoder.print_field_stats()
