@@ -187,9 +187,15 @@ class FieldWiseSMED:
 class AdaptiveKSelector:
     """field별 최적 k (hash 함수 수) 자동 결정.
 
-    k_f = argmin_k [L_proxy(f,k) + λ·Cost(k)]
-        L_proxy = P_col(k) ≈ min(1, |X_f| / (k · M_f))
-        Cost(k) = k / k_max
+    k_f = argmin_k [P_col(f, k) + λ·Cost(k)]
+
+        P_col(f, k) = 1 - exp(-|X_f| / M_f^k)
+            LEAF 논문 Section 3.2 수식.
+            k개의 독립 해시 함수와 M_f개의 버킷을 사용할 때
+            하나의 특성이 적어도 하나의 다른 특성과 충돌할 확률.
+            k가 커질수록 M_f^k가 지수적으로 커지므로 P_col → 0.
+
+        Cost(k) = k / k_max   (정규화된 연산 비용)
     """
 
     def __init__(self, lambda_cost: float = 0.1, k_min: int = 2, k_max: int = 32):
@@ -201,16 +207,21 @@ class AdaptiveKSelector:
     def compute_optimal_k(
         self, cardinality: int, memory_budget: int
     ) -> int:
-        """최적 k 탐색 (grid search over [k_min, k_max])."""
-        M = max(memory_budget, 1)
+        """최적 k 탐색 (grid search over [k_min, k_max]).
+
+        P_col = 1 - exp(-card / M_f^k)  (LEAF 논문 Section 3.2)
+        """
+        M = max(memory_budget, 2)   # M_f^k 계산 시 M=1 이면 P_col 항상 1
         card = max(cardinality, 1)
 
         best_k = self.k_min
         best_loss = float("inf")
 
         for k in range(self.k_min, self.k_max + 1):
-            # 충돌 확률 proxy: 유효 버킷 수 = k * M
-            p_col = min(1.0, card / (k * M))
+            # LEAF 논문 수식: P_col = 1 - exp(-card / M^k)
+            # M^k가 매우 커지면 exp → 1 이므로 수치 안정성을 위해 클리핑
+            exponent = -card / (M ** k)
+            p_col = 1.0 - math.exp(max(exponent, -500.0))  # underflow 방지
             cost = k / self.k_max
             loss = p_col + self.lambda_cost * cost
 
@@ -422,11 +433,11 @@ class FALCONEncoder:
             f"(M_total={self.M_total}, fields={self.n_fields})"
         )
         for i in range(self.n_fields):
-            p_col = min(
-                1.0,
-                self.field_cardinalities[i]
-                / (self.field_k[i] * max(self.field_budgets[i], 1)),
-            )
+            # LEAF 논문 수식: P_col = 1 - exp(-card / M^k)
+            M_i = max(self.field_budgets[i], 2)
+            k_i = self.field_k[i]
+            card_i = max(self.field_cardinalities[i], 1)
+            p_col = 1.0 - math.exp(max(-card_i / (M_i ** k_i), -500.0))
             print(
                 f"[FALCON] Field {i:2d}: "
                 f"card={self.field_cardinalities[i]:>12,}, "
