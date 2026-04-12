@@ -179,38 +179,21 @@ def dlrm_wrap(
     with record_function("DLRM forward"):
 
         # ---------------------------------------------------------------
-        # FALCON 인코딩 경로
+        # FALCON 인코딩 경로 (전체 field 처리)
         # ---------------------------------------------------------------
-        if falcon_encoder is not None and compressed_table_mask is not None:
-            # 압축 대상 field의 raw indices 추출
-            if isinstance(lS_i, torch.Tensor):
-                comp_raw = [lS_i[k] for k in range(lS_i.shape[0]) if compressed_table_mask[k]]
-            else:
-                comp_raw = [lS_i[k] for k in range(len(lS_i)) if compressed_table_mask[k]]
-
-            # FALCON 인코딩: raw(local) → hash bucket indices
-            enc_indices, enc_offsets = falcon_encoder.encode(comp_raw, device=device)
-
-            # lS_i, lS_o 재조합
-            lS_i_new, lS_o_new = [], []
-            comp_ptr = 0
+        if falcon_encoder is not None:
+            # 모든 field의 raw(field-local) indices 추출
             n_fields = lS_i.shape[0] if isinstance(lS_i, torch.Tensor) else len(lS_i)
-            for k in range(n_fields):
-                if compressed_table_mask[k]:
-                    lS_i_new.append(enc_indices[comp_ptr].to(device))
-                    lS_o_new.append(enc_offsets[comp_ptr].to(device))
-                    comp_ptr += 1
-                else:
-                    raw_i = lS_i[k] if not isinstance(lS_i, torch.Tensor) else lS_i[k]
-                    raw_o = lS_o[k] if not isinstance(lS_o, torch.Tensor) else lS_o[k]
-                    lS_i_new.append(raw_i.to(device) if use_gpu else raw_i)
-                    lS_o_new.append(raw_o.to(device) if use_gpu else raw_o)
-            lS_i, lS_o = lS_i_new, lS_o_new
+            all_raw = [lS_i[k] for k in range(n_fields)]
 
-            if X is not None:
-                return dlrm(X.to(device) if use_gpu else X, lS_o, lS_i, test, train_time)
-            else:
-                return dlrm(None, lS_o, lS_i, test, train_time)
+            # FALCON 인코딩: raw(local) → hash bucket indices (전체 22 field)
+            enc_indices, enc_offsets = falcon_encoder.encode(all_raw, device=device)
+
+            lS_i = [e.to(device) for e in enc_indices]
+            lS_o = [o.to(device) for o in enc_offsets]
+
+            X_send = X.to(device) if (X is not None and use_gpu) else X
+            return dlrm(X_send, lS_o, lS_i, test, train_time)
 
         # --- CPU-mode adaptive encoding (runs when use_gpu=False, e.g. Apple Silicon) ---
         if use_adaptive_encoding and not use_gpu:
@@ -1602,28 +1585,27 @@ def run():
         # FALCON 초기화 (--use-falcon)
         # -----------------------------------------------------------------------
         falcon_encoder: FALCONEncoder | None = None
-        # FALCON이 활성화되면 ln_emb에서 field-specific budget을 계산해
-        # compressed_table_mask에 해당하는 각 field의 임베딩 크기를 교체한다.
+        # FALCON은 모든 categorical field를 대상으로 pressure 기반 budget 배분.
+        # M_total = 각 field의 자연 budget 합계 (FALCON 없을 때와 동일 총 메모리).
+        #   - 소형 field (card < capacity): card 그대로 사용
+        #   - 대형 field (card >= capacity): capacity 상한 적용
+        # → 동일 메모리를 field 중요도에 따라 재배분하는 것이 FALCON 핵심.
         if args.use_falcon:
-            compressed_field_cardinalities = ln_emb[compressed_table_mask].tolist()
+            all_field_cardinalities = ln_emb.tolist()
+            M_total_falcon = sum(
+                min(int(c), capacity) for c in ln_emb
+            )
             falcon_encoder = FALCONEncoder(
-                field_cardinalities=compressed_field_cardinalities,
-                M_total=capacity,
+                field_cardinalities=all_field_cardinalities,
+                M_total=M_total_falcon,
                 arch_sparse_feature_size=args.arch_sparse_feature_size,
                 lambda_cost=args.falcon_lambda_cost,
                 K_base=args.falcon_K_base,
                 device=device,
             )
             falcon_encoder.print_field_stats()
-
-            # selected_ln_emb_cum_offsets: FALCON은 field-local 인덱스를 사용
-            # (각 field의 raw값이 0-indexed이므로 field-local cumulative offset으로 변환)
-            selected_ln_emb = ln_emb[compressed_table_mask]
-            selected_ln_emb_tensor = torch.from_numpy(selected_ln_emb)
-            cumulative_sum = torch.cumsum(selected_ln_emb_tensor, dim=0)
-            selected_ln_emb_cum_offsets = torch.cat(
-                (torch.tensor([0]), cumulative_sum[:-1])
-            ).to(device)
+            # FALCON path는 field-local 인덱스를 직접 처리하므로
+            # selected_ln_emb_cum_offsets 불필요 (None 유지)
 
         if args.use_adaptive_encoding:
             selected_ln_emb = ln_emb[compressed_table_mask]
@@ -1642,12 +1624,11 @@ def run():
             surge_k = args.cls_surge_k if args.use_cls else args.num_long_tail_hashes
             surge_long_tail_hash = HashEmbedding(total_unique_indices, args.arch_sparse_feature_size, num_buckets=num_buckets_long_tail, num_hashes=surge_k, append_weight=False, device=device) if (args.use_cls and surge_k > args.num_long_tail_hashes) else None
 
-        # FALCON: 압축 대상 field의 embedding 크기를 field-specific budget으로 교체
+        # FALCON: 전체 field의 embedding 크기를 field-specific budget으로 교체
         if args.use_falcon and falcon_encoder is not None:
-            comp_indices = [i for i, m in enumerate(compressed_table_mask) if m]
-            for field_local_idx, global_idx in enumerate(comp_indices):
-                ln_emb[global_idx] = falcon_encoder.field_budgets[field_local_idx]
-            print(f"[FALCON] ln_emb (field budgets 적용 후): {ln_emb[compressed_table_mask]}")
+            for i, budget in enumerate(falcon_encoder.field_budgets):
+                ln_emb[i] = budget
+            print(f"[FALCON] 전체 {len(ln_emb)}개 field budget 적용 완료: {ln_emb}")
 
         print(f"ln_emb: {ln_emb}")
         hash_rate = 0

@@ -189,13 +189,17 @@ class AdaptiveKSelector:
 
     k_f = argmin_k [P_col(f, k) + λ·Cost(k)]
 
-        P_col(f, k) = 1 - exp(-|X_f| / M_f^k)
-            LEAF 논문 Section 3.2 수식.
-            k개의 독립 해시 함수와 M_f개의 버킷을 사용할 때
-            하나의 특성이 적어도 하나의 다른 특성과 충돌할 확률.
-            k가 커질수록 M_f^k가 지수적으로 커지므로 P_col → 0.
+        P_col(f, k) = max(0, log(card / M_f)) / k   ← 로드 팩터 기반 수식
+            - card < M_f (여유): load < 1 → P_col = 0 → k_min 선택 (비용 절감)
+            - card > M_f (과부하): P_col = log(load)/k → k가 클수록 감소
+            - 해석: 버킷당 평균 충돌 수(load)의 로그를 k로 분산
+            - 해석적 최적: k* ≈ sqrt(log(load) · k_max / λ)
 
         Cost(k) = k / k_max   (정규화된 연산 비용)
+
+    이전 수식 P_col = 1 - exp(-card/M^k) 문제:
+        M^k가 지수적으로 폭발 → P_col ≈ 0 for any k ≥ 2 →
+        optimizer가 항상 k_min=2 선택 (의미 없는 grid search)
     """
 
     def __init__(self, lambda_cost: float = 0.1, k_min: int = 2, k_max: int = 32):
@@ -209,19 +213,25 @@ class AdaptiveKSelector:
     ) -> int:
         """최적 k 탐색 (grid search over [k_min, k_max]).
 
-        P_col = 1 - exp(-card / M_f^k)  (LEAF 논문 Section 3.2)
+        P_col(k) = max(0, log(card / M)) / k
+            - 과부하(card > M): 로드 팩터 로그를 k로 분산
+            - 여유(card ≤ M): P_col = 0, cost만 남아 k_min 선택
         """
-        M = max(memory_budget, 2)   # M_f^k 계산 시 M=1 이면 P_col 항상 1
+        M = max(memory_budget, 1)
         card = max(cardinality, 1)
+        load = card / M
+
+        # 여유 상태: 어떤 k를 써도 충돌 없음 → 최소 비용(k_min) 선택
+        if load <= 1.0:
+            return self.k_min
+
+        log_load = math.log(load)   # load > 1 이므로 양수
 
         best_k = self.k_min
         best_loss = float("inf")
 
         for k in range(self.k_min, self.k_max + 1):
-            # LEAF 논문 수식: P_col = 1 - exp(-card / M^k)
-            # M^k가 매우 커지면 exp → 1 이므로 수치 안정성을 위해 클리핑
-            exponent = -card / (M ** k)
-            p_col = 1.0 - math.exp(max(exponent, -500.0))  # underflow 방지
+            p_col = log_load / k        # k가 클수록 작아짐
             cost = k / self.k_max
             loss = p_col + self.lambda_cost * cost
 
@@ -445,11 +455,12 @@ class FALCONEncoder:
             f"(M_total={self.M_total}, fields={self.n_fields})"
         )
         for i in range(self.n_fields):
-            # LEAF 논문 수식: P_col = 1 - exp(-card / M^k)
-            M_i = max(self.field_budgets[i], 2)
+            # 로드 팩터 기반 P_col 수식 (AdaptiveKSelector와 동일)
+            M_i = max(self.field_budgets[i], 1)
             k_i = self.field_k[i]
             card_i = max(self.field_cardinalities[i], 1)
-            p_col = 1.0 - math.exp(max(-card_i / (M_i ** k_i), -500.0))
+            load_i = card_i / M_i
+            p_col = max(0.0, math.log(load_i)) / k_i if load_i > 1.0 else 0.0
             print(
                 f"[FALCON] Field {i:2d}: "
                 f"card={self.field_cardinalities[i]:>12,}, "
