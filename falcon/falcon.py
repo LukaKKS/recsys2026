@@ -145,32 +145,41 @@ class BudgetAllocator:
 
     # ------------------------------------------------------------------
     def allocate(self, pressures: List[float]) -> List[int]:
-        """pressure 비례 배분 + min_rows 보장."""
+        """pressure 비례 배분.
+
+        CR이 매우 클 때(M_total << n_fields × min_rows) 음수 발생을 방지하기 위해
+        3단계 안전 배분을 사용한다.
+
+          1단계: 순수 비례 배분 (floor at 1)
+          2단계: M_total 여유가 있을 때만 min_rows 적용
+          3단계: 합계가 M_total 초과 시 비율로 줄임 (floor at 1, 음수 불가)
+        """
+        n = self.n_fields
         total_pressure = sum(pressures)
 
         if total_pressure < 1e-10:
-            base = max(self.min_rows, self.M_total // self.n_fields)
-            return [base] * self.n_fields
+            per_field = max(1, self.M_total // n)
+            return [per_field] * n
 
-        # 비례 배분
-        allocations = [
-            max(self.min_rows, int(self.M_total * p / total_pressure))
+        # 1단계: 순수 비례 배분 — 음수/0 방지를 위해 floor at 1
+        allocs = [
+            max(1, int(self.M_total * p / total_pressure))
             for p in pressures
         ]
 
-        # 합계가 M_total 초과 시 초과분 삭감 (min_rows 보호)
-        total_alloc = sum(allocations)
-        if total_alloc > self.M_total:
-            excess = total_alloc - self.M_total
-            reducible = [a - self.min_rows for a in allocations]
-            total_reducible = sum(reducible)
-            if total_reducible > 0:
-                allocations = [
-                    a - int(excess * r / total_reducible)
-                    for a, r in zip(allocations, reducible)
-                ]
+        # 2단계: min_rows 보장 — 전체 합이 M_total 이하일 때만 적용
+        #   (CR이 매우 크면 n_fields × min_rows > M_total 이므로 건너뜀)
+        min_guaranteed = [max(self.min_rows, a) for a in allocs]
+        if sum(min_guaranteed) <= self.M_total:
+            allocs = min_guaranteed
 
-        return allocations
+        # 3단계: 합계가 M_total 초과 시 비율로 축소 — 항상 floor at 1 (음수 불가)
+        total = sum(allocs)
+        if total > self.M_total and total > 0:
+            scale = self.M_total / total
+            allocs = [max(1, int(a * scale)) for a in allocs]
+
+        return allocs
 
 
 # ---------------------------------------------------------------------------
