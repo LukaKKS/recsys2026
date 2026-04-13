@@ -351,12 +351,15 @@ class FALCONEncoder:
             k = self.k_f[i]
             mode = "compress" if self.budget.compressed_mask[i] else "raw-pass"
 
-            # 실제 P_col 계산
-            try:
-                exp_arg = -card / max(M ** k, 1e-300)
-                p_col = 1.0 - math.exp(max(exp_arg, -500.0))
-            except (OverflowError, ZeroDivisionError):
-                p_col = 0.0 if M ** k > card else 1.0
+            # 실제 P_col 계산 (raw-pass field는 압축 없음 → P_col = 0)
+            if not self.budget.compressed_mask[i]:
+                p_col = 0.0
+            else:
+                try:
+                    exp_arg = -card / max(M ** k, 1e-300)
+                    p_col = 1.0 - math.exp(max(exp_arg, -500.0))
+                except (OverflowError, ZeroDivisionError):
+                    p_col = 0.0 if M ** k > card else 1.0
 
             print(
                 f"[FALCON] Field {i:2d}: "
