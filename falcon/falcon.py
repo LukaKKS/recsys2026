@@ -86,6 +86,36 @@ class FieldWiseSMED:
         )
         return {item[0] for item in items}
 
+    # ------------------------------------------------------------------
+    def compute_entropy(self, field_idx: int) -> float:
+        """SMED frequent items로 field의 Shannon 엔트로피 근사 계산.
+
+        SMED는 상위 빈도 항목만 추적하므로 실제 엔트로피를 과소 추정하지만,
+        field 간 상대적 비교에는 충분히 유효함.
+
+        Returns
+        -------
+        H ≥ 0.0  (SMED에 데이터 없으면 0.0)
+        """
+        items = self.sketches[field_idx].get_frequent_items(
+            err_type=frequent_items_error_type.NO_FALSE_POSITIVES,
+            threshold=0,
+        )
+        if not items:
+            return 0.0
+
+        counts = [item[1] for item in items]
+        total = sum(counts)
+        if total == 0:
+            return 0.0
+
+        entropy = 0.0
+        for c in counts:
+            p = c / total
+            if p > 0:
+                entropy -= p * math.log(p)
+        return entropy
+
 
 # ---------------------------------------------------------------------------
 # 2. FieldBudgetAllocator  (단일 M_f, hot/cold 분리 없음)
@@ -236,6 +266,7 @@ class FALCONEncoder:
         arch_sparse_feature_size: int = 16,
         k_scale: float = 5.0,
         K_base: int = 256,
+        phase2_start: int = 10000,
         device: Optional[torch.device] = None,
     ):
         self.field_cardinalities = field_cardinalities
@@ -244,12 +275,19 @@ class FALCONEncoder:
         self.arch_sparse_feature_size = arch_sparse_feature_size
         self.device = device or torch.device("cpu")
 
+        # Phase 2 상태
+        self.phase2_start = phase2_start
+        self.phase2_done = False
+        self.batch_count = 0
+
         # ── 3개 모듈 초기화 ──────────────────────────────────────────────
         self.field_smed = FieldWiseSMED(field_cardinalities, K_base)
 
         self.budget = FieldBudgetAllocator(M_total, field_cardinalities)
 
         self.k_selector = AdaptiveKSelector(k_min=2, k_max=32, k_scale=k_scale)
+
+        print("[FALCON] Phase 1 시작 (load 기반 k)")
 
         # ── field별 k 계산 ─────────────────────────────────────────────
         self.k_f: List[int] = [
@@ -304,9 +342,17 @@ class FALCONEncoder:
         dev = device or self.device
         batch_size = batch_cat_features[0].shape[0]
 
-        # SMED 비동기 업데이트 (GPU 학습과 병렬, v2.1에서는 라우팅에 미사용)
-        # 이전 futures는 GC에 맡기고 새로 발행 (완료 대기 불필요)
+        self.batch_count += 1
+
+        # SMED 비동기 업데이트 (GPU 학습과 병렬)
         self._pending_futures = self.field_smed.update_async(batch_cat_features)
+
+        # Phase 2 체크: SMED warm-up 후 1회만 k 재조정
+        if self.batch_count >= self.phase2_start and not self.phase2_done:
+            # 이전 배치들의 SMED 업데이트 완료 대기 후 엔트로피 계산
+            futures_wait(self._pending_futures)
+            self._pending_futures = []
+            self._apply_phase2()
 
         # raw-pass용 공용 offsets (1 index/sample)
         simple_offsets = torch.arange(batch_size, dtype=torch.long, device=dev)
@@ -338,6 +384,75 @@ class FALCONEncoder:
                 encoded_offsets.append(offsets)
 
         return encoded_indices, encoded_offsets
+
+    # ------------------------------------------------------------------
+    def _apply_phase2(self) -> None:
+        """Phase 2: SMED 엔트로피 기반 k 재조정 (1회만).
+
+        1. 각 field의 Shannon 엔트로피를 SMED에서 추정
+        2. 엔트로피 비례로 k 보정:
+               k_new = k_old × (H_f / H_mean)
+        3. HashEmbedding의 hash 파라미터만 재생성 (embedding.weight 보존)
+           → cold start 없음
+
+        엔트로피가 높은 field (feature가 고르게 분포):
+            충돌 위험 더 큼 → k 증가
+        엔트로피가 낮은 field (소수 feature가 대부분 담당):
+            사실상 몇 개 feature만 자주 등장 → k 감소 가능
+        """
+        print(
+            f"[FALCON] Phase 2 시작 "
+            f"(배치 {self.batch_count}, 엔트로피 기반 k 재조정)"
+        )
+
+        # field별 엔트로피 계산
+        entropies: List[float] = [
+            self.field_smed.compute_entropy(i)
+            for i in range(self.n_fields)
+        ]
+
+        # 압축 field 중 엔트로피 > 0인 것만 평균 계산
+        valid_H = [h for i, h in enumerate(entropies)
+                   if self.budget.compressed_mask[i] and h > 0]
+        if not valid_H:
+            print("[FALCON] Phase 2: SMED 데이터 부족, k 유지")
+            self.phase2_done = True
+            return
+
+        h_mean = sum(valid_H) / len(valid_H)
+
+        n_changed = 0
+        for i in range(self.n_fields):
+            if not self.budget.compressed_mask[i]:
+                continue
+            h_f = entropies[i]
+            if h_f == 0:
+                continue  # SMED 데이터 없는 field: k 유지
+
+            # 엔트로피 비례 k 보정
+            ratio = h_f / h_mean
+            new_k = max(
+                self.k_selector.k_min,
+                min(self.k_selector.k_max, round(self.k_f[i] * ratio)),
+            )
+
+            if new_k != self.k_f[i]:
+                # hash 파라미터만 재생성, embedding.weight 보존
+                self.embeddings[i].update_k(new_k)
+                print(
+                    f"[FALCON] Phase2 Field {i:2d}: "
+                    f"k {self.k_f[i]} → {new_k} "
+                    f"(H={h_f:.3f}, ratio={ratio:.2f})"
+                )
+                self.k_f[i] = new_k
+                n_changed += 1
+
+        print(
+            f"[FALCON] Phase 2 완료 "
+            f"({n_changed}/{self.n_fields}개 field k 조정, "
+            f"embedding.weight 보존)"
+        )
+        self.phase2_done = True
 
     # ------------------------------------------------------------------
     def get_field_ln_emb(self) -> List[int]:

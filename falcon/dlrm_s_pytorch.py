@@ -1468,6 +1468,12 @@ def run():
         default=256,
         help="FALCON FieldWiseSMED: K_f = K_base × log2(card_f)",
     )
+    parser.add_argument(
+        "--falcon-phase2-start",
+        type=int,
+        default=10000,
+        help="FALCON Phase 2 시작 배치 수 (SMED warm-up 후 엔트로피 기반 k 재조정, 기본값 10000)",
+    )
     # CLS Cold Start 모듈
     parser.add_argument("--use-cls", action="store_true", default=False,
                         help="CLS 기반 Cold Start 완화 모듈 활성화")
@@ -1604,6 +1610,7 @@ def run():
                 arch_sparse_feature_size=args.arch_sparse_feature_size,
                 k_scale=args.falcon_k_scale,
                 K_base=args.falcon_K_base,
+                phase2_start=args.falcon_phase2_start,
                 device=device,
             )
             falcon_encoder.print_field_stats()

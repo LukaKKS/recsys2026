@@ -285,6 +285,21 @@ class HashEmbedding(nn.Module):
             offsets = torch.squeeze(offsets, 0)
         return idx_shared_embeddings, offsets
     
+    def update_k(self, new_k: int) -> None:
+        """해시 함수 수(k)만 재생성. EmbeddingBag weight는 보존.
+
+        Phase 2 엔트로피 기반 k 재조정에서 호출:
+          - multiplers_tensor / adders_tensor 재생성 (랜덤 파라미터, 학습값 아님)
+          - num_hashes 업데이트
+          - EmbeddingBag weight는 건드리지 않음 → cold start 없음
+        """
+        dev = self.multiplers_tensor.device
+        new_family = HashFamily(self.bins, moduler=self.moduler)
+        new_mult, new_add = new_family.draw_hashes_tensor(new_k, device=str(dev))
+        self.multiplers_tensor = new_mult
+        self.adders_tensor = new_add
+        self.num_hashes = new_k
+
     def get_hash_embedding_tensors(self, input):
         """
         input: 1d tensor n
