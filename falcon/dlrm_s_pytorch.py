@@ -1448,13 +1448,31 @@ def run():
         "--use-falcon",
         action="store_true",
         default=False,
-        help="FALCON: field-aware k 선택 + pressure 기반 budget 배분",
+        help="FALCON v2: field-aware hot/cold split + P*-based k + pressure budget",
     )
     parser.add_argument(
         "--falcon-lambda-cost",
         type=float,
         default=0.1,
-        help="FALCON AdaptiveKSelector: 충돌-비용 tradeoff 파라미터",
+        help="(v1 호환용, v2에서는 미사용)",
+    )
+    parser.add_argument(
+        "--falcon-P-star",
+        type=float,
+        default=0.01,
+        help="FALCON v2 AdaptiveKSelector: 목표 충돌률 P* (기본값 0.01 = 1%%)",
+    )
+    parser.add_argument(
+        "--falcon-long-tail-ratio",
+        type=float,
+        default=0.9,
+        help="FALCON v2 FieldBudgetAllocator: 저빈도(cold) 테이블 비율 (기본값 0.9)",
+    )
+    parser.add_argument(
+        "--falcon-K-base",
+        type=int,
+        default=256,
+        help="FALCON v2 FieldWiseSMED: K_f = K_base × log2(card_f)",
     )
     # CLS Cold Start 모듈
     parser.add_argument("--use-cls", action="store_true", default=False,
@@ -1585,15 +1603,14 @@ def run():
         #   - 대형 field (card >= capacity): capacity 상한 적용
         # → 동일 메모리를 field 중요도에 따라 재배분하는 것이 FALCON 핵심.
         if args.use_falcon:
-            all_field_cardinalities = ln_emb.tolist()
-            M_total_falcon = sum(
-                min(int(c), capacity) for c in ln_emb
-            )
+            # v2: M_total = capacity (LEAF와 동일한 압축 예산을 field별로 재배분)
             falcon_encoder = FALCONEncoder(
-                field_cardinalities=all_field_cardinalities,
-                M_total=M_total_falcon,
+                field_cardinalities=ln_emb.tolist(),
+                M_total=capacity,
                 arch_sparse_feature_size=args.arch_sparse_feature_size,
-                lambda_cost=args.falcon_lambda_cost,
+                long_tail_ratio=args.falcon_long_tail_ratio,
+                P_star=args.falcon_P_star,
+                K_base=args.falcon_K_base,
                 device=device,
             )
             falcon_encoder.print_field_stats()
@@ -1617,11 +1634,11 @@ def run():
             surge_k = args.cls_surge_k if args.use_cls else args.num_long_tail_hashes
             surge_long_tail_hash = HashEmbedding(total_unique_indices, args.arch_sparse_feature_size, num_buckets=num_buckets_long_tail, num_hashes=surge_k, append_weight=False, device=device) if (args.use_cls and surge_k > args.num_long_tail_hashes) else None
 
-        # FALCON: 전체 field의 embedding 크기를 field-specific budget으로 교체
+        # FALCON v2: field별 embedding 크기를 budget.M_f 로 교체 (M_f = M_cold + M_hot)
         if args.use_falcon and falcon_encoder is not None:
-            for i, budget in enumerate(falcon_encoder.field_budgets):
-                ln_emb[i] = budget
-            print(f"[FALCON] 전체 {len(ln_emb)}개 field budget 적용 완료: {ln_emb}")
+            for i, M_fi in enumerate(falcon_encoder.budget.M_f):
+                ln_emb[i] = M_fi
+            print(f"[FALCON] 전체 {len(ln_emb)}개 field budget 적용 완료")
 
         print(f"ln_emb: {ln_emb}")
         hash_rate = 0
