@@ -453,10 +453,13 @@ class FALCONEncoder:
                 continue  # SMED 데이터 없는 field: k 유지
 
             # 엔트로피 비례 k 보정
+            # ratio가 매우 작으면 k가 k_min까지 떨어져 충돌 폭발 가능
+            # → Phase 1 load 기반 k는 하한선: 절대 현재값보다 줄이지 않음
             ratio = h_f / h_mean
+            k_current = self.k_f[i]
             new_k = max(
-                self.k_selector.k_min,
-                min(self.k_selector.k_max, round(self.k_f[i] * ratio)),
+                k_current,
+                min(self.k_selector.k_max, round(k_current * ratio)),
             )
 
             if new_k != self.k_f[i]:
