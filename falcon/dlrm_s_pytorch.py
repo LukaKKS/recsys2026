@@ -1471,8 +1471,8 @@ def run():
     parser.add_argument(
         "--falcon-phase2-start",
         type=int,
-        default=10000,
-        help="FALCON Phase 2 시작 배치 수 (SMED warm-up 후 엔트로피 기반 k 재조정, 기본값 10000)",
+        default=50000,
+        help="FALCON Phase 2 시작 배치 수 (SMED warm-up 후 엔트로피 기반 k 재조정, 기본값 50000 ≈ Avazu 전체의 18%%)",
     )
     # CLS Cold Start 모듈
     parser.add_argument("--use-cls", action="store_true", default=False,

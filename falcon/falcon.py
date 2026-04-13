@@ -350,8 +350,9 @@ class FALCONEncoder:
         # Phase 2 체크: SMED warm-up 후 1회만 k 재조정
         if self.batch_count >= self.phase2_start and not self.phase2_done:
             # 이전 배치들의 SMED 업데이트 완료 대기 후 엔트로피 계산
-            futures_wait(self._pending_futures)
-            self._pending_futures = []
+            if self._pending_futures:
+                futures_wait(self._pending_futures)
+                self._pending_futures = []
             self._apply_phase2()
 
         # raw-pass용 공용 offsets (1 index/sample)
@@ -405,21 +406,43 @@ class FALCONEncoder:
             f"(배치 {self.batch_count}, 엔트로피 기반 k 재조정)"
         )
 
-        # field별 엔트로피 계산
+        # field별 엔트로피 계산 + 상세 출력
         entropies: List[float] = [
             self.field_smed.compute_entropy(i)
             for i in range(self.n_fields)
         ]
 
+        n_zero = 0
+        for i, h in enumerate(entropies):
+            if not self.budget.compressed_mask[i]:
+                continue
+            if h == 0.0:
+                n_zero += 1
+                print(
+                    f"[FALCON] Phase2 Field {i:2d}: "
+                    f"H=0.000 ⚠️  SMED 데이터 부족 (k 유지)"
+                )
+            else:
+                print(
+                    f"[FALCON] Phase2 Field {i:2d}: "
+                    f"H={h:.3f}, k_current={self.k_f[i]}"
+                )
+
         # 압축 field 중 엔트로피 > 0인 것만 평균 계산
         valid_H = [h for i, h in enumerate(entropies)
                    if self.budget.compressed_mask[i] and h > 0]
         if not valid_H:
-            print("[FALCON] Phase 2: SMED 데이터 부족, k 유지")
+            print("[FALCON] Phase 2: 모든 압축 field SMED 데이터 부족 → k 유지")
             self.phase2_done = True
             return
+        if n_zero > 0:
+            print(
+                f"[FALCON] Phase 2: {n_zero}개 field SMED 부족 "
+                f"→ 해당 field k 유지, 나머지 조정 진행"
+            )
 
         h_mean = sum(valid_H) / len(valid_H)
+        print(f"[FALCON] Phase2 H_mean={h_mean:.3f} (압축 field 평균)")
 
         n_changed = 0
         for i in range(self.n_fields):
