@@ -1457,16 +1457,16 @@ def run():
         help="(v1 호환용, v2에서는 미사용)",
     )
     parser.add_argument(
-        "--falcon-P-star",
+        "--falcon-k-scale",
         type=float,
-        default=0.01,
-        help="FALCON v2.1 AdaptiveKSelector: 목표 충돌률 P* (기본값 0.01 = 1%%)",
+        default=5.0,
+        help="FALCON AdaptiveKSelector: k = ceil(log10(load) × k_scale) (기본값 5.0)",
     )
     parser.add_argument(
         "--falcon-K-base",
         type=int,
         default=256,
-        help="FALCON v2.1 FieldWiseSMED: K_f = K_base × log2(card_f)",
+        help="FALCON FieldWiseSMED: K_f = K_base × log2(card_f)",
     )
     # CLS Cold Start 모듈
     parser.add_argument("--use-cls", action="store_true", default=False,
@@ -1602,7 +1602,7 @@ def run():
                 field_cardinalities=ln_emb.tolist(),
                 M_total=capacity,
                 arch_sparse_feature_size=args.arch_sparse_feature_size,
-                P_star=args.falcon_P_star,
+                k_scale=args.falcon_k_scale,
                 K_base=args.falcon_K_base,
                 device=device,
             )

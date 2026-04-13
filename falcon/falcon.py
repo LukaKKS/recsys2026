@@ -143,54 +143,66 @@ class FieldBudgetAllocator:
 
 
 # ---------------------------------------------------------------------------
-# 3. AdaptiveKSelector  (P*-based theory-driven, k_min=6)
+# 3. AdaptiveKSelector  (load-based, CR-adaptive)
 # ---------------------------------------------------------------------------
 
 class AdaptiveKSelector:
-    """목표 충돌률 P*를 만족하는 최솟값 k를 이론적으로 역산.
+    """load = card / M_f 기반으로 k를 자동 계산.
 
-    LEAF 논문 Section 3.2 수식:
-        P_col = 1 - exp(-|X_f| / M_f^k) ≤ P*
+    설계 원칙:
+        CR이 클수록 M_f가 작아지고 load가 커짐
+        → k를 자동으로 늘려 충돌 보상
+        → 사람이 CR마다 k를 바꿀 필요 없음
 
-    역산:
-        k_f = ceil(log(|X_f| / (-log(1-P*))) / log(M_f))
+    수식:
+        load_f = card_f / M_f
+        k_f    = max(k_min, ceil(log10(load_f) × k_scale))
 
-    v2.1 변경:
-        k_min = 6  (v2의 2 → 6으로 상향, 안전 마진 확보)
-        이유: SMED 라우팅 없이 단일 테이블 사용 → 충돌 여유 필요
+    k_scale=5 기준 예시:
+        load=1       → k=2   (raw-pass 수준)
+        load=10      → k=6   (log10=1  × 5 = 5  → 6)
+        load=100     → k=10  (log10=2  × 5 = 10)
+        load=742     → k=15  (log10=2.87 × 5 ≈ 15)  CR=100 Field 9
+        load=7421    → k=19  (log10=3.87 × 5 ≈ 19)  CR=1000 Field 9
+        load=100000  → k=25  (log10=5  × 5 = 25)
 
-    LEAF k=12 대비:
-        큰 field: k=8~12 (이론 최솟값 기반)
-        작은 field: k=6 (min 보장)
-        → field별 최적화, 낭비 없음
+    P*-역산 방식(v2.1) 대비 장점:
+        P* 역산: CR 변화 시 k가 거의 안 바뀜 (공식 특성상 k_min에 걸림)
+        load 기반: CR ↑ → load ↑ → k 자동 증가 → 균형 유지
     """
 
-    def __init__(self, P_star: float = 0.01, k_min: int = 6, k_max: int = 32):
-        self.P_star = P_star
+    def __init__(
+        self,
+        k_min: int = 2,
+        k_max: int = 32,
+        k_scale: float = 5.0,
+    ):
         self.k_min = k_min
         self.k_max = k_max
+        self.k_scale = k_scale
 
     # ------------------------------------------------------------------
     def compute_k(self, n_features: int, M: int) -> int:
-        """이론적 최솟값 k 계산.
+        """load 기반 k 계산.
 
         Returns
         -------
-        k = 1  : M >= n_features (raw-pass 신호)
+        k = 1              : M >= n_features (raw-pass 신호)
         k ∈ [k_min, k_max] : 압축 field
         """
         if M <= 0:
             return self.k_max
         if M >= n_features:
             return 1        # raw-pass 신호 (FALCONEncoder에서 사용 안 됨)
-        if n_features <= 0 or M <= 1:
-            return self.k_max
+        if n_features <= 0:
+            return self.k_min
+
+        load = n_features / max(M, 1)
+        if load <= 1.0:
+            return self.k_min
 
         try:
-            # k ≥ ceil(log(n / (-log(1-P*))) / log(M))
-            denom = -math.log(1.0 - self.P_star)   # P* < 1 이므로 양수
-            target = math.log(max(n_features / denom, 1.0))
-            k = math.ceil(target / math.log(M))
+            k = math.ceil(math.log10(load) * self.k_scale)
             return max(self.k_min, min(self.k_max, k))
         except (ValueError, ZeroDivisionError):
             return self.k_max
@@ -206,7 +218,7 @@ class FALCONEncoder:
     초기화 시 (1회):
         1. FieldWiseSMED  — 비동기 업데이트 준비 (나중 확장용)
         2. FieldBudgetAllocator — pressure 기반 단일 M_f 결정
-        3. AdaptiveKSelector (k_min=6) — P* 이론값으로 k_f 계산
+        3. AdaptiveKSelector (load 기반) — k_f = ceil(log10(load) × k_scale)
         4. 압축 field별 단일 HashEmbedding 생성
 
     encode() 시 (매 배치):
@@ -222,7 +234,7 @@ class FALCONEncoder:
         field_cardinalities: List[int],
         M_total: int,
         arch_sparse_feature_size: int = 16,
-        P_star: float = 0.01,
+        k_scale: float = 5.0,
         K_base: int = 256,
         device: Optional[torch.device] = None,
     ):
@@ -237,7 +249,7 @@ class FALCONEncoder:
 
         self.budget = FieldBudgetAllocator(M_total, field_cardinalities)
 
-        self.k_selector = AdaptiveKSelector(P_star, k_min=6)
+        self.k_selector = AdaptiveKSelector(k_min=2, k_max=32, k_scale=k_scale)
 
         # ── field별 k 계산 ─────────────────────────────────────────────
         self.k_f: List[int] = [
@@ -344,29 +356,23 @@ class FALCONEncoder:
             f"[FALCON] 전체 budget 배분 완료 "
             f"(M_total={self.M_total:,}, fields={self.n_fields})"
         )
-        print(f"[FALCON] P* = {self.k_selector.P_star}  (목표 충돌률)")
+        print(
+            f"[FALCON] k_scale={self.k_selector.k_scale}  "
+            f"(k = ceil(log10(load) × k_scale), load = card / M_f)"
+        )
 
         for i, card in enumerate(self.field_cardinalities):
             M = self.budget.M_f[i]
             k = self.k_f[i]
             mode = "compress" if self.budget.compressed_mask[i] else "raw-pass"
-
-            # 실제 P_col 계산 (raw-pass field는 압축 없음 → P_col = 0)
-            if not self.budget.compressed_mask[i]:
-                p_col = 0.0
-            else:
-                try:
-                    exp_arg = -card / max(M ** k, 1e-300)
-                    p_col = 1.0 - math.exp(max(exp_arg, -500.0))
-                except (OverflowError, ZeroDivisionError):
-                    p_col = 0.0 if M ** k > card else 1.0
+            load = card / max(M, 1)
 
             print(
                 f"[FALCON] Field {i:2d}: "
                 f"card={card:>12,}, "
+                f"load={load:>8.1f}, "
                 f"k={k:>2}, "
                 f"M={M:>8,}, "
                 f"pressure={self.budget.pressures[i]:.4f}, "
-                f"P_col≈{p_col:.6f}, "
                 f"mode={mode}"
             )
