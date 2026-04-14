@@ -2081,16 +2081,14 @@ def run():
 
                     lS_i_raw_cpu = None
                     if args.use_similarity_hashing and cooc_tracker is not None:
+                        # NOTE: Sim-HASH must not bypass adaptive encoding compression.
+                        # It only adjusts k (num_hashes) for the existing lt/sh HashEmbedding.
                         lS_i_raw_cpu = [x.detach().cpu() for x in lS_i]
                         if j > 0 and j % args.sim_update_freq == 0:
                             cooc_tracker.wait_pending()
                             field_cards = [int(x) for x in ln_emb]
-                            sim_hasher.update_k(
-                                cooc_tracker,
-                                lS_i_raw_cpu,
-                                field_cards,
-                                None,
-                            )
+                            # Field-level tracker no longer needs feature-pair input; keep call shape for compatibility.
+                            sim_hasher.update_k(cooc_tracker, lS_i_raw_cpu, field_cards, None)
                             k_new = int(sim_hasher.get_unified_k())
                             if long_tail_hash is not None and long_tail_hash.num_hashes != k_new:
                                 long_tail_hash.update_k(k_new)

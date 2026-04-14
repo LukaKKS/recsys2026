@@ -1,6 +1,14 @@
 """
-Co-occurrence statistics across fields (background thread, CPU).
-Used by Similarity-aware Hashing to estimate feature / field similarity.
+Lightweight field-level statistics (background thread, CPU).
+
+Goal:
+- Keep adaptive encoding compression logic unchanged.
+- Provide similarity estimates to adjust k only (Similarity-aware Hashing).
+
+Implementation notes:
+- Track per-field feature frequency with decay (no feature-pair table).
+- Compute field-pair similarity via weighted Jaccard over per-field frequency maps.
+  This reduces work to O(num_fields^2) per k-update (e.g. 22x22=484 pairs).
 """
 
 from __future__ import annotations
@@ -9,7 +17,7 @@ import math
 import queue
 import threading
 from collections import defaultdict
-from typing import Any, DefaultDict, List, Tuple
+from typing import Any, DefaultDict, Dict, List
 
 # Per-field local feature ids must be < FIELD_ID_OFFSET (Avazu-safe).
 FIELD_ID_OFFSET = 1_000_000_000
@@ -20,7 +28,7 @@ def _global_id(field_idx: int, feat_id: int) -> int:
 
 
 class CooccurrenceTracker:
-    """Decay-weighted counts and pairwise co-counts within each sample."""
+    """Decay-weighted per-field feature frequency maps (field-level similarity only)."""
 
     def __init__(
         self,
@@ -28,14 +36,19 @@ class CooccurrenceTracker:
         max_track: int = 10000,
         decay: float = 0.99,
         queue_maxsize: int = 64,
+        max_samples_per_batch: int = 32,
     ):
         self.num_fields = int(num_fields)
         self.max_track = int(max_track)
         self.decay = float(decay)
+        self.max_samples_per_batch = int(max_samples_per_batch)
         self.n_batches = 0
 
-        self.count: DefaultDict[int, float] = defaultdict(float)
-        self.co_count: DefaultDict[Tuple[int, int], float] = defaultdict(float)
+        # Per-field feature counts:
+        # counts[field_idx][feat_id] = decayed count
+        self.counts: List[DefaultDict[int, float]] = [
+            defaultdict(float) for _ in range(self.num_fields)
+        ]
 
         self._q: queue.Queue[Any] = queue.Queue(maxsize=queue_maxsize)
         self._stop = threading.Event()
@@ -53,13 +66,13 @@ class CooccurrenceTracker:
             finally:
                 self._q.task_done()
 
-    def _maybe_prune(self) -> None:
-        if len(self.co_count) <= self.max_track * 200:
+    def _maybe_prune_field(self, field_idx: int) -> None:
+        d = self.counts[field_idx]
+        if len(d) <= self.max_track:
             return
-        for k in list(self.co_count.keys()):
-            self.co_count[k] *= 0.5
-        for k in list(self.count.keys()):
-            self.count[k] *= 0.5
+        # Keep top max_track by count (approximate: repeated pruning).
+        items = sorted(d.items(), key=lambda kv: kv[1], reverse=True)[: self.max_track]
+        self.counts[field_idx] = defaultdict(float, {k: float(v) for k, v in items})
 
     def _update_sync(self, batch_cat_features: List[Any]) -> None:
         """batch_cat_features: length num_fields, each (batch_size,) CPU tensor or array."""
@@ -68,26 +81,19 @@ class CooccurrenceTracker:
             return
 
         batch_size = int(batch_cat_features[0].shape[0])
+        n = min(batch_size, self.max_samples_per_batch)
+        if n <= 0:
+            return
+
         d = self.decay
-
-        for s in range(batch_size):
-            sample_features: List[int] = []
-            for f in range(self.num_fields):
-                row = batch_cat_features[f]
-                feat_id = int(row[s].item()) if hasattr(row[s], "item") else int(row[s])
-                gid = _global_id(f, feat_id)
-                sample_features.append(gid)
-                self.count[gid] = self.count[gid] * d + 1.0
-
-            L = len(sample_features)
-            for i in range(L):
-                for j in range(i + 1, L):
-                    a, b = sample_features[i], sample_features[j]
-                    if a > b:
-                        a, b = b, a
-                    self.co_count[(a, b)] = self.co_count[(a, b)] * d + 1.0
-
-        self._maybe_prune()
+        for f in range(self.num_fields):
+            row = batch_cat_features[f]
+            cd = self.counts[f]
+            for s in range(n):
+                v = row[s]
+                feat_id = int(v.item()) if hasattr(v, "item") else int(v)
+                cd[feat_id] = cd[feat_id] * d + 1.0
+            self._maybe_prune_field(f)
 
     def update_async(self, batch_cat_features: List[Any]) -> None:
         try:
@@ -107,51 +113,47 @@ class CooccurrenceTracker:
     def close(self) -> None:
         self._stop.set()
 
-    def get_similarity(
-        self, feat_A: int, feat_B: int, field_A: int, field_B: int
-    ) -> float:
-        gA = _global_id(field_A, feat_A)
-        gB = _global_id(field_B, feat_B)
-        if gA > gB:
-            gA, gB = gB, gA
-        co = self.co_count.get((gA, gB), 0.0)
-        cA = self.count.get(gA, 1.0)
-        cB = self.count.get(gB, 1.0)
-        return float(co / (cA + cB - co + 1e-10))
-
     def get_field_similarity(
         self,
         field_i: int,
         field_j: int,
-        batch_cat_features: List[Any],
-        max_samples: int = 32,
+        batch_cat_features: List[Any] | None = None,
+        max_samples: int = 32,  # kept for backward compatibility (ignored)
     ) -> float:
-        if len(batch_cat_features) != self.num_fields:
+        del batch_cat_features, max_samples
+        fi = int(field_i)
+        fj = int(field_j)
+        if fi < 0 or fj < 0 or fi >= self.num_fields or fj >= self.num_fields:
             return 0.0
-        batch_size = int(batch_cat_features[0].shape[0])
-        n = min(batch_size, max_samples)
-        if n <= 0:
+        if fi == fj:
+            return 1.0
+
+        a: Dict[int, float] = self.counts[fi]
+        b: Dict[int, float] = self.counts[fj]
+        if not a or not b:
             return 0.0
-        total = 0.0
-        for s in range(n):
-
-            def _get(fi: int, sidx: int) -> int:
-                row = batch_cat_features[fi]
-                v = row[sidx]
-                return int(v.item()) if hasattr(v, "item") else int(v)
-
-            total += self.get_similarity(
-                _get(field_i, s), _get(field_j, s), field_i, field_j
-            )
-        return total / n
+        # Weighted Jaccard: sum(min)/sum(max)
+        if len(a) > len(b):
+            a, b = b, a
+        inter = 0.0
+        suma = 0.0
+        for k, va in a.items():
+            suma += va
+            vb = b.get(k)
+            if vb is not None:
+                inter += va if va < vb else vb
+        sumb = float(sum(b.values()))
+        union = (suma + sumb - inter) + 1e-10
+        return float(inter / union)
 
     def get_harmful_collision_rate(
         self,
         field_idx: int,
         M: int,
         k: int,
-        batch_cat_features: List[Any],
+        batch_cat_features: List[Any] | None = None,
     ) -> float:
+        del batch_cat_features
         if M <= 0 or k < 1:
             return 0.0
         try:
@@ -165,7 +167,7 @@ class CooccurrenceTracker:
         for other in range(self.num_fields):
             if other == field_idx:
                 continue
-            sim = self.get_field_similarity(field_idx, other, batch_cat_features)
+            sim = self.get_field_similarity(field_idx, other, None)
             avg_dissim += 1.0 - sim
             cnt += 1
         if cnt == 0:
