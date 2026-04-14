@@ -2296,7 +2296,7 @@ def run():
                         and long_tail_hash is not None
                         and short_head_hash is not None
                         and selected_ln_emb_cum_offsets is not None
-                        and (j % max(int(args.reverse_freq), 1) == 0)
+                        and ((j + 1) % max(int(args.reverse_freq), 1) == 0)
                     ):
                         # Build [num_compressed, batch_size] LOCAL id tensor (same as adaptive encoding input).
                         if isinstance(lS_i, torch.Tensor):
@@ -2325,7 +2325,7 @@ def run():
                             progress=progress,
                             device=device,
                         )
-                        if j % 1024 == 0:
+                        if (j + 1) % 1024 == 0:
                             # compact field breakdown (nonzero only)
                             nz = [
                                 (fi, c)
@@ -2335,7 +2335,7 @@ def run():
                             nz = sorted(nz, key=lambda x: x[1], reverse=True)[:8]
                             detail = ", ".join([f"F{fi}:{c}" for fi, c in nz]) if nz else "-"
                             print(
-                                f"[REVERSE] batch={j} transferred={rev_stats.transferred_pairs} "
+                                f"[REVERSE] batch={j + 1} transferred={rev_stats.transferred_pairs} "
                                 f"beta={rev_stats.beta:.3f} (freq={args.reverse_freq}, {detail})",
                                 flush=True,
                             )
