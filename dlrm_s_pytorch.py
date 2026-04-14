@@ -80,6 +80,7 @@ import adaptive_encoding as ae
 # CLS Cold Start 모듈
 from transfer_module import TransferModule
 from dynamic_lr import DynamicLR
+from reverse_transfer import ReverseTransferModule
 
 # numpy
 import numpy as np
@@ -1507,6 +1508,32 @@ def run():
                              "이 기간 동안 스케치 카운터가 높아도 short_head_indices_set 재진입 차단. "
                              "grace 경과 후 재등장하면 재전환으로 감지.")
 
+    # Reverse Transfer (hot -> cold within same field)
+    parser.add_argument(
+        "--use-reverse-transfer",
+        action="store_true",
+        default=False,
+        help="Reverse transfer: hot->cold within the same field (CLS-LEAF extension)",
+    )
+    parser.add_argument(
+        "--reverse-beta-min",
+        type=float,
+        default=0.05,
+        help="Reverse transfer beta at start",
+    )
+    parser.add_argument(
+        "--reverse-beta-max",
+        type=float,
+        default=0.3,
+        help="Reverse transfer beta at end",
+    )
+    parser.add_argument(
+        "--reverse-sim-threshold",
+        type=float,
+        default=0.5,
+        help="Cosine similarity threshold for reverse transfer",
+    )
+
 
     global args
     global nbatches
@@ -1516,6 +1543,8 @@ def run():
 
     if args.use_similarity_hashing and not args.use_adaptive_encoding:
         sys.exit("ERROR: --use-similarity-hashing requires --use-adaptive-encoding")
+    if args.use_reverse_transfer and not (args.use_adaptive_encoding and args.use_cls):
+        sys.exit("ERROR: --use-reverse-transfer requires --use-adaptive-encoding and --use-cls")
 
     if args.hash_flag:
         print(f"hash_flag: {args.hash_flag}")
@@ -1912,6 +1941,7 @@ def run():
     # -----------------------------------------------------------------
     transfer_module = None
     dynamic_lr = None
+    reverse_transfer = None
     if args.use_adaptive_encoding and args.use_cls:
         if long_tail_hash is not None and selected_ln_emb_cum_offsets is not None:
             # --cls-alpha 고정값이 지정된 경우 alpha_min=alpha_max로 동작
@@ -1943,6 +1973,28 @@ def run():
         else:
             print("[CLS] --use-cls 지정됐지만 adaptive encoding이 비활성 상태 → CLS 스킵")
     # -----------------------------------------------------------------
+
+    # -----------------------------------------------------------------
+    # Reverse Transfer 모듈 초기화 (CLS-LEAF 확장)
+    # -----------------------------------------------------------------
+    if args.use_reverse_transfer:
+        num_comp = (
+            int(selected_ln_emb_cum_offsets.shape[0])
+            if selected_ln_emb_cum_offsets is not None
+            else 0
+        )
+        reverse_transfer = ReverseTransferModule(
+            num_fields=num_comp,
+            field_cardinalities=ln_emb.tolist(),
+            beta_min=args.reverse_beta_min,
+            beta_max=args.reverse_beta_max,
+            sim_threshold=args.reverse_sim_threshold,
+        )
+        print(
+            f"[REVERSE] ReverseTransferModule init "
+            f"(num_comp_fields={num_comp}, beta=[{args.reverse_beta_min},{args.reverse_beta_max}], "
+            f"sim_threshold={args.reverse_sim_threshold})"
+        )
 
     # test prints
     if args.debug_mode:
@@ -2209,6 +2261,59 @@ def run():
                             set(),
                         )
                         accumulated_newly_frequent |= _batch_newly_freq
+
+                    # Reverse Transfer (hot -> cold within same compressed field)
+                    # Requires: adaptive encoding + CLS (short_head_indices_set is meaningful).
+                    if (
+                        args.use_reverse_transfer
+                        and reverse_transfer is not None
+                        and args.use_adaptive_encoding
+                        and args.use_cls
+                        and long_tail_hash is not None
+                        and short_head_hash is not None
+                        and selected_ln_emb_cum_offsets is not None
+                    ):
+                        # Build [num_compressed, batch_size] LOCAL id tensor (same as adaptive encoding input).
+                        if isinstance(lS_i, torch.Tensor):
+                            selected_local = lS_i[compressed_table_mask]
+                        else:
+                            mask_indices = [k for k, m in enumerate(compressed_table_mask) if m]
+                            selected_local = torch.stack([lS_i[k] for k in mask_indices])
+
+                        # Shared compressed EmbeddingBag weight (all compressed fields share one module).
+                        if transfer_module is not None and transfer_module.compressed_table_indices:
+                            comp_k0 = transfer_module.compressed_table_indices[0]
+                        else:
+                            comp_k0 = [k for k, m in enumerate(compressed_table_mask) if m][0]
+                        shared_weight = dlrm.emb_l[comp_k0].weight.data
+
+                        total_steps = max(int(args.nepochs) * int(nbatches), 1)
+                        progress = float((k * int(nbatches) + j) / total_steps)
+
+                        rev_stats = reverse_transfer.transfer(
+                            batch_cat_features=selected_local,
+                            selected_ln_emb_offsets=selected_ln_emb_cum_offsets,
+                            short_head_indices_set=short_head_indices_set,
+                            shared_emb_weight=shared_weight,
+                            long_tail_hash=long_tail_hash,
+                            short_head_hash=short_head_hash,
+                            progress=progress,
+                            device=device,
+                        )
+                        if j % 1024 == 0:
+                            # compact field breakdown (nonzero only)
+                            nz = [
+                                (fi, c)
+                                for fi, c in enumerate(rev_stats.transferred_by_field)
+                                if c > 0
+                            ]
+                            nz = sorted(nz, key=lambda x: x[1], reverse=True)[:8]
+                            detail = ", ".join([f"F{fi}:{c}" for fi, c in nz]) if nz else "-"
+                            print(
+                                f"[REVERSE] batch={j} transferred={rev_stats.transferred_pairs} "
+                                f"beta={rev_stats.beta:.3f} ({detail})",
+                                flush=True,
+                            )
 
                     # Dynamic SMED decay: short_head_indices_set에서
                     # 저빈도 항목을 주기적으로 제거 → 재전환 유도

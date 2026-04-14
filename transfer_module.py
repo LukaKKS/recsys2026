@@ -17,6 +17,12 @@ import torch.nn as nn
 import numpy as np
 from typing import Set, Optional
 
+try:
+    # Optional module (enabled via --use-reverse-transfer)
+    from reverse_transfer import ReverseTransferModule  # noqa: F401
+except Exception:
+    ReverseTransferModule = None  # type: ignore
+
 
 class TransferModule:
     """
