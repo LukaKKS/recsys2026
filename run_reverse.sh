@@ -14,6 +14,7 @@ python dlrm_s_pytorch.py \
   --cls-decay-grace=100 \
   --reverse-beta-min=0.05 \
   --reverse-beta-max=0.3 \
+  --reverse-sim-threshold-min=0.1 \
   --reverse-sim-threshold=0.5 \
   --reverse-freq=1000 \
   --compression-ratio=100 \

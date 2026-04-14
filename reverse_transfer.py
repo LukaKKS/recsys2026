@@ -39,6 +39,7 @@ class ReverseTransferModule:
         beta_min: float = 0.05,
         beta_max: float = 0.3,
         sim_threshold: float = 0.5,
+        sim_threshold_min: float = 0.1,
         max_hot: int = 64,
         max_cold: int = 128,
     ):
@@ -47,6 +48,7 @@ class ReverseTransferModule:
         self.beta_min = float(beta_min)
         self.beta_max = float(beta_max)
         self.sim_threshold = float(sim_threshold)
+        self.sim_threshold_min = float(sim_threshold_min)
         self.max_hot = int(max_hot)
         self.max_cold = int(max_cold)
         self.total_batches = 0
@@ -56,9 +58,11 @@ class ReverseTransferModule:
         return float(self.beta_min + (self.beta_max - self.beta_min) * p)
 
     def get_threshold(self, progress: float) -> float:
-        # Dynamic threshold: low early, high late
+        # Dynamic threshold: threshold_min early, threshold_max late
         p = float(max(0.0, min(1.0, progress)))
-        return float(self.sim_threshold * p)
+        tmax = float(self.sim_threshold)
+        tmin = float(self.sim_threshold_min)
+        return float(tmax * p + tmin * (1.0 - p))
 
     @torch.no_grad()
     def transfer(

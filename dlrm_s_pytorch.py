@@ -1542,7 +1542,13 @@ def run():
         "--reverse-sim-threshold",
         type=float,
         default=0.5,
-        help="Cosine similarity threshold for reverse transfer",
+        help="Reverse transfer similarity threshold max (late training)",
+    )
+    parser.add_argument(
+        "--reverse-sim-threshold-min",
+        type=float,
+        default=0.1,
+        help="Reverse transfer similarity threshold min (early training)",
     )
     parser.add_argument(
         "--reverse-freq",
@@ -2006,11 +2012,12 @@ def run():
             beta_min=args.reverse_beta_min,
             beta_max=args.reverse_beta_max,
             sim_threshold=args.reverse_sim_threshold,
+            sim_threshold_min=args.reverse_sim_threshold_min,
         )
         print(
             f"[REVERSE] ReverseTransferModule init "
             f"(num_comp_fields={num_comp}, beta=[{args.reverse_beta_min},{args.reverse_beta_max}], "
-            f"sim_threshold={args.reverse_sim_threshold})"
+            f"sim_threshold=[{args.reverse_sim_threshold_min},{args.reverse_sim_threshold}])"
         )
 
     # test prints
