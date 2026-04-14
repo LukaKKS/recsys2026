@@ -118,58 +118,172 @@ class FieldWiseSMED:
 
 
 # ---------------------------------------------------------------------------
-# 2. FieldBudgetAllocator  (단일 M_f, hot/cold 분리 없음)
+# 2. FieldBudgetAllocator  (동적 압축 field + pressure 재배분)
 # ---------------------------------------------------------------------------
 
+def _pressure_allocate_subset(
+    indices: List[int],
+    budget: int,
+    cards: List[int],
+    min_rows: int = 1,
+) -> Dict[int, int]:
+    """indices 집합에만 budget을 log(card) pressure로 배분.
+
+    반환: i -> M_f (각 i에 대해 min(cards[i], alloc[i])), 합 ≤ budget.
+    """
+    if not indices or budget <= 0:
+        return {}
+    nS = len(indices)
+    logs = [math.log(max(cards[i], 2)) for i in indices]
+    tot_log = sum(logs)
+    if tot_log < 1e-12:
+        base = max(min_rows, budget // nS)
+        raw = [base for _ in range(nS)]
+    else:
+        raw = [max(min_rows, int(budget * logs[j] / tot_log)) for j in range(nS)]
+
+    total = sum(raw)
+    if total > budget and total > 0:
+        scale = budget / total
+        raw = [max(min_rows, int(r * scale)) for r in raw]
+
+    total = sum(raw)
+    rem = budget - total
+    # 남은 budget을 아직 card 미만인 슬롯에 1씩 분배
+    while rem > 0:
+        progressed = False
+        for j in range(nS):
+            if rem <= 0:
+                break
+            i = indices[j]
+            if raw[j] < cards[i]:
+                raw[j] += 1
+                rem -= 1
+                progressed = True
+        if not progressed:
+            break
+
+    return {indices[j]: min(cards[indices[j]], raw[j]) for j in range(nS)}
+
+
 class FieldBudgetAllocator:
-    """카디널리티 pressure 기반 field-aware 메모리 배분.
+    """field-aware budget + 동적 압축 field 수 (CR에 따라 자동).
 
-    pressure_f = log(card_f) / Σ log(card_i)
-    M_f = M_total × pressure_f   (min 1, 카디널리티 상한 적용)
+    Phase A — log(card) pressure로 현재 압축 후보 집합 S에 budget 배분.
+    Phase B — ``M_f / card < compress_min_ratio`` 이고
+              ``card <= demote_max_card`` 인 field는
+              raw-pass( M_f = card )로 전환 후 budget을 남은 압축 field에 재배분.
 
-    v2와의 차이: M_hot / M_cold 분리 없음.
-    M_f 전체를 단일 HashEmbedding에 사용 → SMED cold-start 문제 해소.
+    효과:
+        고압축(CR↑) 시 압축 '가치'가 없는 소형 field는 raw-pass로 빠지고
+        대형 field에 M_total이 집중 → LEAF(소수 field 압축)에 가까운 형태.
 
-    음수 budget 방지 (CR=10000):
-        1단계: 비례 배분 (floor at 1)
-        2단계: M_total 초과 시 비율 축소 (floor at 1)
-        3단계: 카디널리티 상한 적용
+    raw-pass 전환 시 ``sum(M_f) == M_total`` 을 유지:
+        raw-pass field는 ``M_f = card`` 행을 사용하므로,
+        전환 가능 여부는 ``고정 raw 비용 + 남은 field 최소 1행`` 이 M_total 이하인지로 검증.
     """
 
     def __init__(
         self,
         M_total: int,
         field_cardinalities: List[int],
+        compress_min_ratio: float = 0.008,
+        demote_max_card: int = 300_000,
+        max_iterations: int = 64,
         min_rows: int = 1,
     ):
         self.M_total = M_total
         self.field_cardinalities = field_cardinalities
         self.n_fields = len(field_cardinalities)
+        self.compress_min_ratio = float(compress_min_ratio)
+        self.demote_max_card = int(demote_max_card)
+        cards = field_cardinalities
+        n = self.n_fields
 
-        # pressure 계산 (카디널리티 기반, 학습 중 고정)
-        log_cards = [math.log(max(c, 2)) for c in field_cardinalities]
+        # 전역 pressure (로그 출력용, 고정)
+        log_cards = [math.log(max(c, 2)) for c in cards]
         total_log = sum(log_cards)
-        self.pressures: List[float] = [lc / total_log for lc in log_cards]
-
-        # 1단계: 비례 배분
-        raw = [max(min_rows, int(M_total * p)) for p in self.pressures]
-
-        # 2단계: M_total 초과 시 비율 축소
-        total = sum(raw)
-        if total > M_total and total > 0:
-            scale = M_total / total
-            raw = [max(min_rows, int(r * scale)) for r in raw]
-
-        # 3단계: 카디널리티 상한 적용 (여유 field는 card로 고정)
-        self.M_f: List[int] = [
-            min(card, budget)
-            for card, budget in zip(field_cardinalities, raw)
+        self.pressures: List[float] = [
+            lc / total_log if total_log > 1e-12 else 1.0 / n
+            for lc in log_cards
         ]
 
-        # 압축 필요 여부 (card > M_f → 해싱 필요)
-        self.compressed_mask: List[bool] = [
-            card > m for card, m in zip(field_cardinalities, self.M_f)
-        ]
+        fixed_raw: Set[int] = set()  # full-card embedding, no hash
+        n_demoted = 0
+
+        for _ in range(max_iterations):
+            S = [i for i in range(n) if i not in fixed_raw]
+            fixed_cost = sum(cards[i] for i in fixed_raw)
+            B = M_total - fixed_cost
+
+            if B < len(S) * min_rows:
+                # raw-pass가 너무 많아져 budget 부족 → 현재 fixed_raw 기준으로 최종 배분
+                Bf = max(1, B)
+                alloc_map = _pressure_allocate_subset(S, Bf, cards, min_rows)
+                self.M_f = [
+                    cards[i] if i in fixed_raw else alloc_map.get(i, min_rows)
+                    for i in range(n)
+                ]
+                self.compressed_mask = [cards[i] > self.M_f[i] for i in range(n)]
+                self.fixed_raw_pass_indices = set(fixed_raw)
+                self.n_budget_demotions = n_demoted
+                break
+
+            alloc_map = _pressure_allocate_subset(S, B, cards, min_rows)
+            M_f = [0] * n
+            for i in range(n):
+                if i in fixed_raw:
+                    M_f[i] = cards[i]
+                else:
+                    M_f[i] = alloc_map.get(i, min_rows)
+
+            # violators: 압축인데 비율 너무 낮고, full-card 전환이 budget 가능한 소형 field
+            violators: List[int] = []
+            for i in S:
+                if M_f[i] >= cards[i]:
+                    continue
+                ratio = M_f[i] / max(cards[i], 1)
+                if ratio >= compress_min_ratio:
+                    continue
+                if cards[i] > demote_max_card:
+                    continue
+                new_fixed = fixed_raw | {i}
+                new_fixed_cost = sum(cards[j] for j in new_fixed)
+                S2 = [j for j in range(n) if j not in new_fixed]
+                min_rest = len(S2) * min_rows
+                if new_fixed_cost + min_rest <= M_total:
+                    violators.append(i)
+
+            if not violators:
+                self.M_f = M_f
+                self.compressed_mask = [cards[i] > M_f[i] for i in range(n)]
+                self.fixed_raw_pass_indices = set(fixed_raw)
+                self.n_budget_demotions = n_demoted
+                break
+
+            v = min(violators, key=lambda idx: cards[idx])
+            fixed_raw.add(v)
+            n_demoted += 1
+        else:
+            # max_iterations 소진
+            S = [i for i in range(n) if i not in fixed_raw]
+            fixed_cost = sum(cards[i] for i in fixed_raw)
+            B = M_total - fixed_cost
+            alloc_map = _pressure_allocate_subset(S, max(B, len(S)), cards, min_rows)
+            self.M_f = [
+                cards[i] if i in fixed_raw else alloc_map.get(i, min_rows)
+                for i in range(n)
+            ]
+            self.compressed_mask = [cards[i] > self.M_f[i] for i in range(n)]
+            self.fixed_raw_pass_indices = set(fixed_raw)
+            self.n_budget_demotions = n_demoted
+
+        n_cmp = sum(self.compressed_mask)
+        print(
+            f"[FALCON] Budget: 동적 압축 field 선택 "
+            f"(τ={self.compress_min_ratio}, demote_max_card={self.demote_max_card}, "
+            f"raw-pass 전환 {self.n_budget_demotions}회, 압축 field {n_cmp}/{n})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +380,9 @@ class FALCONEncoder:
         arch_sparse_feature_size: int = 16,
         k_scale: float = 5.0,
         K_base: int = 256,
-        phase2_start: int = 10000,
+        phase2_start: int = 50000,
+        compress_min_ratio: float = 0.008,
+        demote_max_card: int = 300_000,
         device: Optional[torch.device] = None,
     ):
         self.field_cardinalities = field_cardinalities
@@ -283,7 +399,12 @@ class FALCONEncoder:
         # ── 3개 모듈 초기화 ──────────────────────────────────────────────
         self.field_smed = FieldWiseSMED(field_cardinalities, K_base)
 
-        self.budget = FieldBudgetAllocator(M_total, field_cardinalities)
+        self.budget = FieldBudgetAllocator(
+            M_total,
+            field_cardinalities,
+            compress_min_ratio=compress_min_ratio,
+            demote_max_card=demote_max_card,
+        )
 
         self.k_selector = AdaptiveKSelector(k_min=2, k_max=32, k_scale=k_scale)
 

@@ -1474,6 +1474,18 @@ def run():
         default=50000,
         help="FALCON Phase 2 시작 배치 수 (SMED warm-up 후 엔트로피 기반 k 재조정, 기본값 50000 ≈ Avazu 전체의 18%%)",
     )
+    parser.add_argument(
+        "--falcon-compress-min-ratio",
+        type=float,
+        default=0.008,
+        help="FALCON 동적 budget: M_f/card < 이 값이면 소형 field raw-pass 후보 (기본 0.008)",
+    )
+    parser.add_argument(
+        "--falcon-demote-max-card",
+        type=int,
+        default=300_000,
+        help="FALCON 동적 budget: raw-pass로 전환 가능한 최대 카디널리티 (이보다 큰 field는 k만 조정)",
+    )
     # CLS Cold Start 모듈
     parser.add_argument("--use-cls", action="store_true", default=False,
                         help="CLS 기반 Cold Start 완화 모듈 활성화")
@@ -1611,6 +1623,8 @@ def run():
                 k_scale=args.falcon_k_scale,
                 K_base=args.falcon_K_base,
                 phase2_start=args.falcon_phase2_start,
+                compress_min_ratio=args.falcon_compress_min_ratio,
+                demote_max_card=args.falcon_demote_max_card,
                 device=device,
             )
             falcon_encoder.print_field_stats()
