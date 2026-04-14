@@ -284,6 +284,16 @@ class HashEmbedding(nn.Module):
         if offsets.shape[0] == 1:
             offsets = torch.squeeze(offsets, 0)
         return idx_shared_embeddings, offsets
+
+    def update_k(self, new_k: int) -> None:
+        """Regenerate hash multipliers/adders only; keep embedding table (sim-hash k updates)."""
+        dev = self.multiplers_tensor.device
+        new_family = HashFamily(self.bins, moduler=self.moduler)
+        new_mult, new_add = new_family.draw_hashes_tensor(new_k, device=str(dev))
+        self.multiplers_tensor = new_mult
+        self.adders_tensor = new_add
+        self.num_hashes = new_k
+        self.hashes = new_family.draw_hashes(new_k)
     
     def get_hash_embedding_tensors(self, input):
         """

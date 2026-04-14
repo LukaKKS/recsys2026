@@ -116,6 +116,8 @@ from joblib import Parallel, delayed
 from functools import partial
 from itertools import combinations
 from hash_embedding import HashEmbedding
+from cooccurrence_tracker import CooccurrenceTracker
+from similarity_hashing import SimilarityAwareHash
 
 
 with warnings.catch_warnings():
@@ -171,6 +173,8 @@ def dlrm_wrap(
     train_time=None,
     transfer_module=None,
     surge_long_tail_hash=None,
+    use_similarity_hashing=False,
+    sim_hasher=None,
 ):
     with record_function("DLRM forward"):
         # --- CPU-mode adaptive encoding (runs when use_gpu=False, e.g. Apple Silicon) ---
@@ -193,6 +197,8 @@ def dlrm_wrap(
                 short_head_indices_set,
                 transfer_module=transfer_module,
                 surge_long_tail_hash=surge_long_tail_hash,
+                use_similarity_hashing=use_similarity_hashing,
+                sim_hasher=sim_hasher,
             )
             lS_i_tmp = []
             j = 0
@@ -234,6 +240,8 @@ def dlrm_wrap(
                             short_head_indices_set,
                             transfer_module=transfer_module,
                             surge_long_tail_hash=surge_long_tail_hash,
+                            use_similarity_hashing=use_similarity_hashing,
+                            sim_hasher=sim_hasher,
                         )
 
                         lS_i_tmp = []
@@ -1113,7 +1121,9 @@ def inference(
     long_tail_hash,
     iteration_index,
     frequency_percentile,
-    short_head_indices_set
+    short_head_indices_set,
+    use_similarity_hashing=False,
+    sim_hasher=None,
 ):
     test_accu = 0
     test_samp = 0
@@ -1159,6 +1169,8 @@ def inference(
             frequency_percentile=frequency_percentile,
             short_head_indices_set=short_head_indices_set,
             transfer_module=None,
+            use_similarity_hashing=use_similarity_hashing,
+            sim_hasher=sim_hasher,
         )
         if Z_test.is_cuda:
             torch.cuda.synchronize()
@@ -1410,6 +1422,18 @@ def run():
     parser.add_argument("--is-coding-reversed", action="store_true", default=False)
     parser.add_argument("--reverse-and-shift-huffman-coding", action="store_true", default=False)
     parser.add_argument("--use-adaptive-encoding", action="store_true", default=False)
+    parser.add_argument(
+        "--use-similarity-hashing",
+        action="store_true",
+        default=False,
+        help="Co-occurrence based similarity-aware hashing (Sim-HASH)",
+    )
+    parser.add_argument(
+        "--sim-update-freq",
+        type=int,
+        default=1000,
+        help="Batches between Sim-HASH k updates",
+    )
     parser.add_argument("--num-rand-rows", type=int, default=0)
     parser.add_argument("--num-hashes", type=int, default=2)
     parser.add_argument("--num-long-tail-hashes", type=int, default=10)
@@ -1447,6 +1471,9 @@ def run():
     global writer
     args = parser.parse_args()
 
+    if args.use_similarity_hashing and not args.use_adaptive_encoding:
+        sys.exit("ERROR: --use-similarity-hashing requires --use-adaptive-encoding")
+
     if args.hash_flag:
         print(f"hash_flag: {args.hash_flag}")
     elif args.use_huffman_coding:
@@ -1455,6 +1482,8 @@ def run():
         print(f"sketch_flag: {args.sketch_flag}")
     elif args.use_adaptive_encoding:
         print(f"use_adaptive_encoding: {args.use_adaptive_encoding}")
+        if args.use_similarity_hashing:
+            print(f"use_similarity_hashing: {args.use_similarity_hashing}, sim_update_freq={args.sim_update_freq}")
     elif args.use_hash_embedding:
         print(f"use_hash_embedding: {args.use_hash_embedding}")
     else:
@@ -1537,6 +1566,9 @@ def run():
         short_head_indices_set = set()
         # coldstart AUC 측정용: 마지막 테스트 이후 전환된 특성 누적
         accumulated_newly_frequent: set = set()
+        cooc_tracker = None
+        sim_hasher = None
+        simhash_M_buckets = 0
 
         if args.use_adaptive_encoding:
             selected_ln_emb = ln_emb[compressed_table_mask]
@@ -1554,6 +1586,16 @@ def run():
             # surge-k: 전환 특성에 더 많은 해시 함수 적용 (같은 lt 버킷 범위, 다른 hash 함수)
             surge_k = args.cls_surge_k if args.use_cls else args.num_long_tail_hashes
             surge_long_tail_hash = HashEmbedding(total_unique_indices, args.arch_sparse_feature_size, num_buckets=num_buckets_long_tail, num_hashes=surge_k, append_weight=False, device=device) if (args.use_cls and surge_k > args.num_long_tail_hashes) else None
+
+            simhash_M_buckets = num_buckets_long_tail
+            if args.use_similarity_hashing:
+                cooc_tracker = CooccurrenceTracker(num_fields=len(ln_emb))
+                sim_hasher = SimilarityAwareHash(
+                    num_fields=len(ln_emb),
+                    k_base=args.num_long_tail_hashes,
+                    k_min=4,
+                    k_max=32,
+                )
 
         print(f"ln_emb: {ln_emb}")
         hash_rate = 0
@@ -2036,6 +2078,46 @@ def run():
 
                     # = args.mini_batch_size except maybe for last
                     mbs = T.shape[0]
+
+                    lS_i_raw_cpu = None
+                    if args.use_similarity_hashing and cooc_tracker is not None:
+                        lS_i_raw_cpu = [x.detach().cpu() for x in lS_i]
+                        if j > 0 and j % args.sim_update_freq == 0:
+                            cooc_tracker.wait_pending()
+                            field_cards = [int(x) for x in ln_emb]
+                            sim_hasher.update_k(
+                                cooc_tracker,
+                                lS_i_raw_cpu,
+                                field_cards,
+                                None,
+                            )
+                            k_new = int(sim_hasher.get_unified_k())
+                            if long_tail_hash is not None and long_tail_hash.num_hashes != k_new:
+                                long_tail_hash.update_k(k_new)
+                            if short_head_hash is not None and short_head_hash.num_hashes != k_new:
+                                short_head_hash.update_k(k_new)
+                            if surge_long_tail_hash is not None:
+                                surge_tgt = max(int(args.cls_surge_k), k_new)
+                                if surge_long_tail_hash.num_hashes != surge_tgt:
+                                    surge_long_tail_hash.update_k(surge_tgt)
+                            hcr_list = []
+                            for fi in range(len(ln_emb)):
+                                hcr_list.append(
+                                    cooc_tracker.get_harmful_collision_rate(
+                                        fi, simhash_M_buckets, k_new, lS_i_raw_cpu
+                                    )
+                                )
+                            hcr_mean = float(sum(hcr_list) / max(len(hcr_list), 1))
+                            p_base = 0.0
+                            try:
+                                p_base = 1.0 - math.exp(
+                                    -1.0
+                                    / max(float(simhash_M_buckets) ** max(k_new - 1, 1), 1e-12)
+                                )
+                            except OverflowError:
+                                p_base = 1.0
+                            print(f"[SIM-HASH] batch={j} unified_k={k_new} (raw P_col~{p_base:.4f})")
+                            sim_hasher.print_stats(hcr=hcr_mean)
                     
                     internal_train_timer = [0]
                     external_train_timer = time.time()
@@ -2074,6 +2156,8 @@ def run():
                         train_time=internal_train_timer,
                         transfer_module=transfer_module,
                         surge_long_tail_hash=surge_long_tail_hash,
+                        use_similarity_hashing=args.use_similarity_hashing,
+                        sim_hasher=sim_hasher,
                     )
 
                     # Cold Start AUC: 전환 특성 누적 (should_test 시점에 일괄 측정)
@@ -2149,6 +2233,9 @@ def run():
                         # optimizer
                         optimizer.step()
                         lr_scheduler.step()
+
+                    if lS_i_raw_cpu is not None and cooc_tracker is not None:
+                        cooc_tracker.update_async(lS_i_raw_cpu)
                     
                     internal_time_diff = time.time() - internal_train_timer[0]
                     internal_total_time += internal_time_diff
@@ -2242,7 +2329,9 @@ def run():
                             long_tail_hash,
                             j,
                             args.frequency_percentile,
-                            short_head_indices_set
+                            short_head_indices_set,
+                            args.use_similarity_hashing,
+                            sim_hasher,
                         )
 
                         # Cold Start 시각화용 로그 (--test-freq=1 시 매 배치 출력)
@@ -2286,6 +2375,8 @@ def run():
                                     train_time=[0.0],
                                     transfer_module=None,       # 테스트 중 상태 변경 방지
                                     surge_long_tail_hash=None,
+                                    use_similarity_hashing=args.use_similarity_hashing,
+                                    sim_hasher=sim_hasher,
                                 )
                             compute_coldstart_auc(
                                 forward_fn=_cs_forward,
@@ -2355,8 +2446,8 @@ def run():
                 iteration_index=-1,
                 frequency_percentile=args.frequency_percentile,
                 short_head_indices_set=short_head_indices_set,
-                transfer_module=None,
-                surge_long_tail_hash=None,
+                use_similarity_hashing=args.use_similarity_hashing,
+                sim_hasher=sim_hasher,
             )
 
     # profiling

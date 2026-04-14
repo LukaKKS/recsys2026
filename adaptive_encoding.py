@@ -4,7 +4,7 @@ import numpy as np
 import pickle
 import random
 from collections import defaultdict
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 import time
 import os
 import ctypes
@@ -331,6 +331,8 @@ def batch_adaptive_encoding_with_hashing(
     short_head_indices_set=set(),
     transfer_module=None,
     surge_long_tail_hash=None,
+    use_similarity_hashing: bool = False,
+    sim_hasher: Optional[Any] = None,
 ):
     if emb_indices_tensor.dim() == 1:
         emb_indices_tensor = emb_indices_tensor.unsqueeze(1)
@@ -352,10 +354,15 @@ def batch_adaptive_encoding_with_hashing(
         short_head_mask = torch.any(emb_indices.unsqueeze(1) == short_head_tensor.unsqueeze(0), dim=1)
 
         # 기본 lt/sh 라우팅 (num_hashes, n)
-        num_hashes = long_tail_hashing.num_hashes
+        if use_similarity_hashing and sim_hasher is not None:
+            num_hashes = int(sim_hasher.get_unified_k())
+        else:
+            num_hashes = int(long_tail_hashing.num_hashes)
         n = emb_indices.shape[0]
-        base_lt = long_tail_operation(emb_indices, long_tail_hashing)   # [num_hashes, n]
-        base_sh = short_head_operation(emb_indices, short_head_hashing) # [num_hashes, n]
+        base_lt = long_tail_operation(emb_indices, long_tail_hashing)
+        base_sh = short_head_operation(emb_indices, short_head_hashing)
+        assert base_lt.shape[0] == num_hashes, "Sim-hash k와 long_tail_hash 불일치; forward 전 update_k 필요"
+        assert base_sh.shape[0] == num_hashes, "Sim-hash k와 short_head_hash 불일치"
         result = torch.where(short_head_mask, base_sh, base_lt)         # [num_hashes, n]
 
         # surge-k: 직전 배치에서 전환된 특성을 더 많은 해시 함수로 재해싱
