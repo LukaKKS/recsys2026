@@ -453,12 +453,23 @@ class DLRM_Net(nn.Module):
             elif use_hash_embedding and ln[i] > self.capacity:
                 n = self.capacity
 
-            print(f"embedding table {i} number of trainable parameters: {n * m}")
-            if use_adaptive_encoding and ln[i] > self.capacity:
-                # Count shared parameters once.
+            # NOTE: With adaptive encoding, all compressed tables share ONE EmbeddingBag.
+            # Per-table print below can be misleading; we explicitly mark shared reuse.
+            is_compressed_shared = bool(use_adaptive_encoding and ln[i] > self.capacity)
+            if is_compressed_shared:
                 if shared_compressed_EE is None:
+                    print(
+                        f"embedding table {i} number of trainable parameters: {n * m} "
+                        f"(shared compressed table, counted once)"
+                    )
                     total_num_trainable_parameters += n * m
+                else:
+                    print(
+                        f"embedding table {i} number of trainable parameters: {n * m} "
+                        f"(shared compressed table, REUSE, +0 unique params)"
+                    )
             else:
+                print(f"embedding table {i} number of trainable parameters: {n * m}")
                 total_num_trainable_parameters += n * m
 
             # construct embedding operator
