@@ -416,6 +416,10 @@ class DLRM_Net(nn.Module):
         v_W_l = []
         tot_nums = 0
         N = 0
+        # Adaptive encoding compression uses a single shared budget (M_total).
+        # Compressed tables must share ONE EmbeddingBag to avoid duplicating capacity per field.
+        shared_compressed_EE = None
+        shared_compressed_n = None
         if self.ada_flag:
             for i in range(0, ln.size):
                 if ln[i] > 2000 * self.compress_rate:
@@ -449,7 +453,12 @@ class DLRM_Net(nn.Module):
                 n = self.capacity
 
             print(f"embedding table {i} number of trainable parameters: {n * m}")
-            total_num_trainable_parameters += n * m
+            if use_adaptive_encoding and ln[i] > self.capacity:
+                # Count shared parameters once.
+                if shared_compressed_EE is None:
+                    total_num_trainable_parameters += n * m
+            else:
+                total_num_trainable_parameters += n * m
 
             # construct embedding operator
             if self.qr_flag and n > self.qr_threshold:
@@ -498,24 +507,58 @@ class DLRM_Net(nn.Module):
                 self.sketch_emb[i] = True
                 N += 1
             else:
-                if self.md_flag:
-                    EE = nn.EmbeddingBag(n, max(m), mode="sum", sparse=True)
+                # Default EmbeddingBag path (includes adaptive encoding compressed tables).
+                if use_adaptive_encoding and ln[i] > self.capacity:
+                    if shared_compressed_EE is None:
+                        shared_compressed_n = n
+                        if self.md_flag:
+                            shared_compressed_EE = nn.EmbeddingBag(
+                                n, max(m), mode="sum", sparse=True
+                            )
+                        else:
+                            shared_compressed_EE = nn.EmbeddingBag(
+                                n, m, mode="sum", sparse=True
+                            )
+                        tmp_n = max(n, 5)
+                        if self.md_flag:
+                            W = np.random.uniform(
+                                low=-np.sqrt(1 / tmp_n),
+                                high=np.sqrt(1 / tmp_n),
+                                size=(n, max(m)),
+                            ).astype(np.float32)
+                        else:
+                            W = np.random.uniform(
+                                low=-np.sqrt(1 / tmp_n),
+                                high=np.sqrt(1 / tmp_n),
+                                size=(n, m),
+                            ).astype(np.float32)
+                        shared_compressed_EE.weight.data = torch.tensor(
+                            W, requires_grad=True
+                        )
+                    else:
+                        assert (
+                            shared_compressed_n == n
+                        ), "Adaptive encoding compressed tables must share the same capacity"
+                    EE = shared_compressed_EE
                 else:
-                    EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True)
-                # initialize embeddings
-                # nn.init.uniform_(EE.weight, a=-np.sqrt(1 / n), b=np.sqrt(1 / n))
-                tmp_n = max(n, 5)
-                
-                if self.md_flag:
-                    W = np.random.uniform(
-                        low=-np.sqrt(1 / tmp_n), high=np.sqrt(1 / tmp_n), size=(n, max(m))
-                    ).astype(np.float32)
-                else:
-                    W = np.random.uniform(
-                        low=-np.sqrt(1 / tmp_n), high=np.sqrt(1 / tmp_n), size=(n, m)
-                    ).astype(np.float32)
-                # approach 1
-                EE.weight.data = torch.tensor(W, requires_grad=True)
+                    if self.md_flag:
+                        EE = nn.EmbeddingBag(n, max(m), mode="sum", sparse=True)
+                    else:
+                        EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True)
+                    tmp_n = max(n, 5)
+                    if self.md_flag:
+                        W = np.random.uniform(
+                            low=-np.sqrt(1 / tmp_n),
+                            high=np.sqrt(1 / tmp_n),
+                            size=(n, max(m)),
+                        ).astype(np.float32)
+                    else:
+                        W = np.random.uniform(
+                            low=-np.sqrt(1 / tmp_n),
+                            high=np.sqrt(1 / tmp_n),
+                            size=(n, m),
+                        ).astype(np.float32)
+                    EE.weight.data = torch.tensor(W, requires_grad=True)
                 # approach 2
                 # EE.weight.data.copy_(torch.tensor(W))
                 # approach 3
