@@ -2325,20 +2325,21 @@ def run():
                             progress=progress,
                             device=device,
                         )
-                        if (j + 1) % 1024 == 0:
-                            # compact field breakdown (nonzero only)
-                            nz = [
-                                (fi, c)
-                                for fi, c in enumerate(rev_stats.transferred_by_field)
-                                if c > 0
-                            ]
-                            nz = sorted(nz, key=lambda x: x[1], reverse=True)[:8]
-                            detail = ", ".join([f"F{fi}:{c}" for fi, c in nz]) if nz else "-"
-                            print(
-                                f"[REVERSE] batch={j + 1} transferred={rev_stats.transferred_pairs} "
-                                f"beta={rev_stats.beta:.3f} (freq={args.reverse_freq}, {detail})",
-                                flush=True,
-                            )
+                        # Log on the same cadence as reverse transfer.
+                        # compact field breakdown (nonzero only)
+                        nz = [
+                            (fi, c)
+                            for fi, c in enumerate(rev_stats.transferred_by_field)
+                            if c > 0
+                        ]
+                        nz = sorted(nz, key=lambda x: x[1], reverse=True)[:8]
+                        detail = ", ".join([f"F{fi}:{c}" for fi, c in nz]) if nz else "-"
+                        print(
+                            f"[REVERSE] batch={j + 1} transferred={rev_stats.transferred_pairs} "
+                            f"beta={rev_stats.beta:.3f} threshold={rev_stats.threshold:.3f} "
+                            f"(freq={args.reverse_freq}, {detail})",
+                            flush=True,
+                        )
 
                     # Dynamic SMED decay: short_head_indices_set에서
                     # 저빈도 항목을 주기적으로 제거 → 재전환 유도

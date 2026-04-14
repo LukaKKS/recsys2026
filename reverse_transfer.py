@@ -29,6 +29,7 @@ class ReverseTransferStats:
     transferred_pairs: int
     transferred_by_field: Sequence[int]
     beta: float
+    threshold: float
 
 
 class ReverseTransferModule:
@@ -155,5 +156,6 @@ class ReverseTransferModule:
             transferred_pairs=transferred_pairs,
             transferred_by_field=transferred_by_field,
             beta=beta,
+            threshold=thr,
         )
 
