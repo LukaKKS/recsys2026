@@ -1544,6 +1544,12 @@ def run():
         default=0.5,
         help="Cosine similarity threshold for reverse transfer",
     )
+    parser.add_argument(
+        "--reverse-freq",
+        type=int,
+        default=1000,
+        help="Batches between reverse transfer runs",
+    )
 
 
     global args
@@ -2283,6 +2289,7 @@ def run():
                         and long_tail_hash is not None
                         and short_head_hash is not None
                         and selected_ln_emb_cum_offsets is not None
+                        and (j % max(int(args.reverse_freq), 1) == 0)
                     ):
                         # Build [num_compressed, batch_size] LOCAL id tensor (same as adaptive encoding input).
                         if isinstance(lS_i, torch.Tensor):
@@ -2322,7 +2329,7 @@ def run():
                             detail = ", ".join([f"F{fi}:{c}" for fi, c in nz]) if nz else "-"
                             print(
                                 f"[REVERSE] batch={j} transferred={rev_stats.transferred_pairs} "
-                                f"beta={rev_stats.beta:.3f} ({detail})",
+                                f"beta={rev_stats.beta:.3f} (freq={args.reverse_freq}, {detail})",
                                 flush=True,
                             )
 

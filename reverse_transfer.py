@@ -55,6 +55,11 @@ class ReverseTransferModule:
         p = float(max(0.0, min(1.0, progress)))
         return float(self.beta_min + (self.beta_max - self.beta_min) * p)
 
+    def get_threshold(self, progress: float) -> float:
+        # Dynamic threshold: low early, high late
+        p = float(max(0.0, min(1.0, progress)))
+        return float(self.sim_threshold * p)
+
     @torch.no_grad()
     def transfer(
         self,
@@ -82,6 +87,7 @@ class ReverseTransferModule:
             HashEmbedding objects (same as used by adaptive encoding).
         """
         beta = self.get_beta(progress)
+        thr = self.get_threshold(progress)
         num_fields = int(batch_cat_features.shape[0])
         transferred_by_field = [0 for _ in range(num_fields)]
         transferred_pairs = 0
@@ -128,7 +134,7 @@ class ReverseTransferModule:
             cold_norm = F.normalize(cold_emb, dim=1)
             sim = hot_norm @ cold_norm.t()  # [n_hot, n_cold]
 
-            h_idx, c_idx = torch.where(sim > self.sim_threshold)
+            h_idx, c_idx = torch.where(sim > thr)
             if h_idx.numel() == 0:
                 continue
 
