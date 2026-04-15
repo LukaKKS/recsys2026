@@ -31,6 +31,7 @@ class ReverseTransferStats:
     beta: float
     threshold: float
     selected_fields: Sequence[int]
+    selected_global_fields: Sequence[int]
 
 
 class ReverseTransferModule:
@@ -38,6 +39,7 @@ class ReverseTransferModule:
         self,
         num_fields: int,
         field_cardinalities: Sequence[int],
+        global_field_ids: Optional[Sequence[int]] = None,
         beta_min: float = 0.05,
         beta_max: float = 0.3,
         sim_threshold: float = 0.5,
@@ -49,6 +51,15 @@ class ReverseTransferModule:
     ):
         self.num_fields = int(num_fields)
         self.field_cardinalities = list(map(int, field_cardinalities))
+        if global_field_ids is None:
+            self.global_field_ids = list(range(self.num_fields))
+        else:
+            gids = list(map(int, global_field_ids))
+            if len(gids) != self.num_fields:
+                raise ValueError(
+                    f"global_field_ids length mismatch: got {len(gids)} vs num_fields={self.num_fields}"
+                )
+            self.global_field_ids = gids
         self.beta_min = float(beta_min)
         self.beta_max = float(beta_max)
         self.sim_threshold = float(sim_threshold)
@@ -123,6 +134,7 @@ class ReverseTransferModule:
         transferred_by_field = [0 for _ in range(num_fields)]
         transferred_pairs = 0
         selected_fields = self._select_field_indices()
+        selected_global_fields = [int(self.global_field_ids[i]) for i in selected_fields]
 
         offsets = selected_ln_emb_offsets.to(device=device, dtype=torch.long)
         sh_set = short_head_indices_set  # local alias
@@ -185,5 +197,6 @@ class ReverseTransferModule:
             beta=beta,
             threshold=thr,
             selected_fields=selected_fields,
+            selected_global_fields=selected_global_fields,
         )
 

@@ -1660,6 +1660,9 @@ def run():
         nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
         nbatches_test = len(test_ld)
         ln_emb = train_data.counts
+        # Keep raw table sizes for auxiliary modules (e.g. reverse transfer top-K)
+        # before max_ind_range clamping mutates ln_emb.
+        ln_emb_raw_counts = np.asarray(ln_emb, dtype=np.int64).copy()
 
         capacity = get_capacity(args.compression_ratio, ln_emb)
         print(f"compression_ratio: {args.compression_ratio} capacity: {capacity}")
@@ -2018,10 +2021,12 @@ def run():
             if selected_ln_emb_cum_offsets is not None
             else 0
         )
-        comp_cards = ln_emb[compressed_table_mask].astype(int).tolist()
+        comp_cards = ln_emb_raw_counts[compressed_table_mask].astype(int).tolist()
+        comp_global_ids = np.where(compressed_table_mask)[0].astype(int).tolist()
         reverse_transfer = ReverseTransferModule(
             num_fields=num_comp,
             field_cardinalities=comp_cards,
+            global_field_ids=comp_global_ids,
             beta_min=args.reverse_beta_min,
             beta_max=args.reverse_beta_max,
             sim_threshold=args.reverse_sim_threshold,
@@ -2350,11 +2355,12 @@ def run():
                         ]
                         nz = sorted(nz, key=lambda x: x[1], reverse=True)[:8]
                         detail = ", ".join([f"F{fi}:{c}" for fi, c in nz]) if nz else "-"
-                        sel = ",".join(str(x) for x in rev_stats.selected_fields)
+                        sel_local = ",".join(str(x) for x in rev_stats.selected_fields)
+                        sel_global = ",".join(str(x) for x in rev_stats.selected_global_fields)
                         print(
                             f"[REVERSE] batch={j + 1} transferred={rev_stats.transferred_pairs} "
                             f"beta={rev_stats.beta:.3f} threshold={rev_stats.threshold:.3f} "
-                            f"(freq={args.reverse_freq}, fields=[{sel}], {detail})",
+                            f"(freq={args.reverse_freq}, comp_idx=[{sel_local}], field=[{sel_global}], {detail})",
                             flush=True,
                         )
 

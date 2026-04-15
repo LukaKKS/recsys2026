@@ -159,37 +159,46 @@ class TransferModule:
 
         transferred = 0
         with torch.no_grad():
+            # Group by underlying EmbeddingBag module to enable vectorized updates.
+            groups: dict[int, list[int]] = {}
             for g_idx in newly_frequent:
-                table_pos, local_idx = self._global_to_table(g_idx)
+                table_pos, _local_idx = self._global_to_table(g_idx)
                 if table_pos is None:
                     continue
+                emb_k = int(self.compressed_table_indices[table_pos])
+                groups.setdefault(emb_k, []).append(int(g_idx))
 
-                k = self.compressed_table_indices[table_pos]
-                emb_bag = self.emb_l[k]  # nn.EmbeddingBag
-                n_rows = emb_bag.weight.shape[0]
+            a = float(self.alpha)
+            oa = 1.0 - a
 
-                # device 일치 보장
-                g_tensor = torch.tensor([g_idx], dtype=torch.long, device=device)
+            for emb_k, g_list in groups.items():
+                if not g_list:
+                    continue
+                emb_bag = self.emb_l[emb_k]  # nn.EmbeddingBag
+                n_rows = int(emb_bag.weight.shape[0])
+                w = emb_bag.weight.data
 
-                # 각 HashEmbedding에서 버킷 인덱스 추출
-                # shape: [num_hashes, 1]
-                lt_buckets = self.long_tail_hash.get_hash_embedding_tensors(g_tensor)
-                sh_buckets = self.short_head_hash.get_hash_embedding_tensors(g_tensor)
+                G = torch.tensor(g_list, dtype=torch.long, device=device)
+                # shape: [num_hashes, n]
+                lt_buckets = self.long_tail_hash.get_hash_embedding_tensors(G)
+                sh_buckets = self.short_head_hash.get_hash_embedding_tensors(G)
+                n_hashes = int(lt_buckets.shape[0])
+                n = int(G.shape[0])
 
-                # num_hashes 차원을 순회하며 이전
-                n_hashes = lt_buckets.shape[0]
                 for h in range(n_hashes):
-                    lt_b = int(lt_buckets[h, 0].item())
-                    sh_b = int(sh_buckets[h, 0].item())
+                    lt_b = lt_buckets[h].to(dtype=torch.long)
+                    sh_b = sh_buckets[h].to(dtype=torch.long)
+                    ok = (lt_b >= 0) & (lt_b < n_rows) & (sh_b >= 0) & (sh_b < n_rows)
+                    if not bool(ok.any().item()):
+                        continue
+                    lt_b = lt_b[ok]
+                    sh_b = sh_b[ok]
+                    lt_vec = w[lt_b]  # [m, dim]
+                    sh_vec = w[sh_b]  # [m, dim]
+                    new_sh = a * lt_vec + oa * sh_vec
+                    w[sh_b] = new_sh
 
-                    if 0 <= lt_b < n_rows and 0 <= sh_b < n_rows:
-                        lt_vec = emb_bag.weight.data[lt_b].clone()
-                        sh_vec = emb_bag.weight.data[sh_b]
-                        emb_bag.weight.data[sh_b] = (
-                            self.alpha * lt_vec + (1.0 - self.alpha) * sh_vec
-                        )
-
-                transferred += 1
+                transferred += n
 
         return transferred
 
