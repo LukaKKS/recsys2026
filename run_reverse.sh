@@ -17,6 +17,8 @@ python dlrm_s_pytorch.py \
   --reverse-sim-threshold-min=0.1 \
   --reverse-sim-threshold=0.5 \
   --reverse-freq=1000 \
+  --reverse-top-k-fields=3 \
+  --reverse-auto-select-min-fields=4 \
   --compression-ratio=100 \
   "$@"
 

@@ -18,7 +18,7 @@ Important (LEAF adaptive encoding):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence, Set, Tuple
+from typing import List, Optional, Sequence, Set
 
 import torch
 import torch.nn.functional as F
@@ -30,6 +30,7 @@ class ReverseTransferStats:
     transferred_by_field: Sequence[int]
     beta: float
     threshold: float
+    selected_fields: Sequence[int]
 
 
 class ReverseTransferModule:
@@ -43,6 +44,8 @@ class ReverseTransferModule:
         sim_threshold_min: float = 0.1,
         max_hot: int = 64,
         max_cold: int = 128,
+        top_k_fields: int = 3,
+        auto_select_min_fields: int = 4,
     ):
         self.num_fields = int(num_fields)
         self.field_cardinalities = list(map(int, field_cardinalities))
@@ -52,6 +55,8 @@ class ReverseTransferModule:
         self.sim_threshold_min = float(sim_threshold_min)
         self.max_hot = int(max_hot)
         self.max_cold = int(max_cold)
+        self.top_k_fields = int(max(1, top_k_fields))
+        self.auto_select_min_fields = int(max(2, auto_select_min_fields))
         self.total_batches = 0
 
     def get_beta(self, progress: float) -> float:
@@ -64,6 +69,27 @@ class ReverseTransferModule:
         tmax = float(self.sim_threshold)
         tmin = float(self.sim_threshold_min)
         return float(tmax * p + tmin * (1.0 - p))
+
+    def _select_field_indices(self) -> List[int]:
+        """
+        If there are many compressed fields, only process top-K by cardinality
+        to keep per-step compute roughly stable.
+        """
+        nf = self.num_fields
+        if nf <= 0:
+            return []
+        if nf < self.auto_select_min_fields:
+            return list(range(nf))
+
+        k = min(self.top_k_fields, nf)
+        pairs = sorted(
+            [(i, int(self.field_cardinalities[i])) for i in range(nf)],
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        chosen = [i for i, _ in pairs[:k]]
+        chosen.sort()
+        return chosen
 
     @torch.no_grad()
     def transfer(
@@ -96,11 +122,12 @@ class ReverseTransferModule:
         num_fields = int(batch_cat_features.shape[0])
         transferred_by_field = [0 for _ in range(num_fields)]
         transferred_pairs = 0
+        selected_fields = self._select_field_indices()
 
         offsets = selected_ln_emb_offsets.to(device=device, dtype=torch.long)
         sh_set = short_head_indices_set  # local alias
 
-        for f in range(num_fields):
+        for f in selected_fields:
             local_ids = batch_cat_features[f].to(device=device, dtype=torch.long)
             if local_ids.numel() == 0:
                 continue
@@ -157,5 +184,6 @@ class ReverseTransferModule:
             transferred_by_field=transferred_by_field,
             beta=beta,
             threshold=thr,
+            selected_fields=selected_fields,
         )
 

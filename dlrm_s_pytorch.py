@@ -1556,6 +1556,18 @@ def run():
         default=1000,
         help="Batches between reverse transfer runs",
     )
+    parser.add_argument(
+        "--reverse-top-k-fields",
+        type=int,
+        default=3,
+        help="When many compressed fields exist, process only top-K by cardinality",
+    )
+    parser.add_argument(
+        "--reverse-auto-select-min-fields",
+        type=int,
+        default=4,
+        help="Enable top-K field selection when compressed field count >= this value",
+    )
 
 
     global args
@@ -2006,18 +2018,22 @@ def run():
             if selected_ln_emb_cum_offsets is not None
             else 0
         )
+        comp_cards = ln_emb[compressed_table_mask].astype(int).tolist()
         reverse_transfer = ReverseTransferModule(
             num_fields=num_comp,
-            field_cardinalities=ln_emb.tolist(),
+            field_cardinalities=comp_cards,
             beta_min=args.reverse_beta_min,
             beta_max=args.reverse_beta_max,
             sim_threshold=args.reverse_sim_threshold,
             sim_threshold_min=args.reverse_sim_threshold_min,
+            top_k_fields=args.reverse_top_k_fields,
+            auto_select_min_fields=args.reverse_auto_select_min_fields,
         )
         print(
             f"[REVERSE] ReverseTransferModule init "
             f"(num_comp_fields={num_comp}, beta=[{args.reverse_beta_min},{args.reverse_beta_max}], "
-            f"sim_threshold=[{args.reverse_sim_threshold_min},{args.reverse_sim_threshold}])"
+            f"sim_threshold=[{args.reverse_sim_threshold_min},{args.reverse_sim_threshold}], "
+            f"top_k={args.reverse_top_k_fields}, auto_select_min={args.reverse_auto_select_min_fields})"
         )
 
     # test prints
@@ -2334,10 +2350,11 @@ def run():
                         ]
                         nz = sorted(nz, key=lambda x: x[1], reverse=True)[:8]
                         detail = ", ".join([f"F{fi}:{c}" for fi, c in nz]) if nz else "-"
+                        sel = ",".join(str(x) for x in rev_stats.selected_fields)
                         print(
                             f"[REVERSE] batch={j + 1} transferred={rev_stats.transferred_pairs} "
                             f"beta={rev_stats.beta:.3f} threshold={rev_stats.threshold:.3f} "
-                            f"(freq={args.reverse_freq}, {detail})",
+                            f"(freq={args.reverse_freq}, fields=[{sel}], {detail})",
                             flush=True,
                         )
 
