@@ -101,7 +101,7 @@ class OnlineFrequencyChecker:
         current_batch : int
             현재 배치 번호.
         decay_freq : int
-            decay 적용 주기 (배치 단위).
+            decay 적용 주기 (배치 단위). 0 이하이면 decay 비활성(항상 빈 집합 반환).
         min_size : int
             short_head_indices_set 최소 유지 크기.
         grace_period : int
@@ -113,6 +113,8 @@ class OnlineFrequencyChecker:
         set
             이번 decay에서 저빈도로 내려간 인덱스 집합.
         """
+        if decay_freq <= 0:
+            return set()
         if current_batch % decay_freq != 0 or current_batch == 0:
             return set()
         if not short_head_indices_set:
