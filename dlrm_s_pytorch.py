@@ -1569,6 +1569,20 @@ def run():
         default=4,
         help="Enable top-K field selection when compressed field count >= this value",
     )
+    parser.add_argument(
+        "--reverse-start-batch",
+        type=int,
+        default=0,
+        help="0-based batch index: reverse transfer runs only for batches j with j >= this value "
+             "(default 0 = from the beginning).",
+    )
+    parser.add_argument(
+        "--reverse-stop-batch",
+        type=int,
+        default=-1,
+        help="0-based batch index: reverse transfer runs only while j < stop "
+             "(-1 disables the upper bound). Must be > --reverse-start-batch when set.",
+    )
 
 
     global args
@@ -1581,6 +1595,12 @@ def run():
         sys.exit("ERROR: --use-similarity-hashing requires --use-adaptive-encoding")
     if args.use_reverse_transfer and not (args.use_adaptive_encoding and args.use_cls):
         sys.exit("ERROR: --use-reverse-transfer requires --use-adaptive-encoding and --use-cls")
+    if int(args.reverse_start_batch) < 0:
+        sys.exit("ERROR: --reverse-start-batch must be >= 0")
+    if int(args.reverse_stop_batch) != -1 and int(args.reverse_stop_batch) <= int(args.reverse_start_batch):
+        sys.exit(
+            "ERROR: --reverse-stop-batch must be -1 (disabled) or strictly greater than --reverse-start-batch"
+        )
 
     if args.hash_flag:
         print(f"hash_flag: {args.hash_flag}")
@@ -2035,11 +2055,15 @@ def run():
             top_k_fields=args.reverse_top_k_fields,
             auto_select_min_fields=args.reverse_auto_select_min_fields,
         )
+        rsb = int(args.reverse_start_batch)
+        rstop = int(args.reverse_stop_batch)
+        win = f"batch_window=[{rsb}, {rstop})" if rstop >= 0 else f"batch_window=[{rsb}, inf)"
         print(
             f"[REVERSE] ReverseTransferModule init "
             f"(num_comp_fields={num_comp}, beta=[{args.reverse_beta_min},{args.reverse_beta_max}], "
             f"sim_threshold=[{args.reverse_sim_threshold_min},{args.reverse_sim_threshold}], "
-            f"top_k={args.reverse_top_k_fields}, auto_select_min={args.reverse_auto_select_min_fields})"
+            f"top_k={args.reverse_top_k_fields}, auto_select_min={args.reverse_auto_select_min_fields}, "
+            f"{win})"
         )
 
     # test prints
@@ -2318,6 +2342,10 @@ def run():
                         and long_tail_hash is not None
                         and short_head_hash is not None
                         and selected_ln_emb_cum_offsets is not None
+                        and (j >= int(args.reverse_start_batch))
+                        and (
+                            int(args.reverse_stop_batch) < 0 or j < int(args.reverse_stop_batch)
+                        )
                         and ((j + 1) % max(int(args.reverse_freq), 1) == 0)
                     ):
                         # Build [num_compressed, batch_size] LOCAL id tensor (same as adaptive encoding input).
@@ -2361,7 +2389,8 @@ def run():
                         print(
                             f"[REVERSE] batch={j + 1} transferred={rev_stats.transferred_pairs} "
                             f"beta={rev_stats.beta:.3f} threshold={rev_stats.threshold:.3f} "
-                            f"(freq={args.reverse_freq}, comp_idx=[{sel_local}], field=[{sel_global}], {detail})",
+                            f"(freq={args.reverse_freq}, start={args.reverse_start_batch}, "
+                            f"stop={args.reverse_stop_batch}, comp_idx=[{sel_local}], field=[{sel_global}], {detail})",
                             flush=True,
                         )
 

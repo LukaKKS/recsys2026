@@ -2,6 +2,10 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Optional: schedule reverse on batch index j (0-based) by passing extra flags via "$@":
+#   - run only while j < N:   --reverse-stop-batch=N
+#   - run only for j >= M:   --reverse-start-batch=M
+
 python dlrm_s_pytorch.py \
   --use-adaptive-encoding \
   --use-cls \
